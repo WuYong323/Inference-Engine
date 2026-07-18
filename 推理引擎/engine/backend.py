@@ -71,7 +71,7 @@ class TorchBackend(Backend):
         # weight 形如 [out, in]，所以用 x @ w.T（等价于 nn.Linear 的 no-bias 前向）。
         # "fused"在 TorchBackend 里其实没真融合——纯 PyTorch 会拆成好几个 kernel。
         gate=F.silu(x@w_gate.T)
-        up=gate@w_up.T
+        up=x@w_up.T
         return (gate*up)@w_down.T
 
 
