@@ -175,7 +175,8 @@ if __name__=="__main__":
         save_dict={
             'model':model.state_dict(),
             'model_args':{
-                'vocab_size':config['vocab_size'],
+                'batch_size':config['batch_size'],
+                'vocab_size':vocab_size,
                 'block_size':config['block_size'],
                 'n_layer':config['n_layer'],
                 'n_head':config['n_head'],
