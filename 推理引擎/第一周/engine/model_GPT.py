@@ -94,7 +94,7 @@ class GPT(nn.Module):
     def forward(self,idx,targets=None):
         B,T=idx.shape
         tok_emb=self.transformer.wte(idx)
-        pos_emb=self.transformer.wpe(torch.arange(T,device=idx.devicd))
+        pos_emb=self.transformer.wpe(torch.arange(T,device=idx.device))
         x=tok_emb+pos_emb
         for block in self.transformer.h:
             x=block(x)
@@ -121,6 +121,7 @@ class GPT(nn.Module):
 @dataclass
 class GPTConfig:
     vocab_size:int=50257
+    batch_size:int=16
     block_size:int=1024
     n_embd:int=768
     n_head:int=12
@@ -130,15 +131,6 @@ class GPTConfig:
 
 if __name__=="__main__":
     torch.manual_seed(0)
-
-    config={
-        'batch_size':16,
-        'block_size':128,
-        'n_embd':256,
-        'n_head':4,
-        'n_layer':4,
-        'dropout':0.0,
-    }
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -152,6 +144,16 @@ if __name__=="__main__":
     decode = lambda l: ''.join(itos[i] for i in l)
     data = torch.tensor(encode(words), dtype=torch.long)
 
+    config={
+        'vocab_size':vocab_size,
+        'batch_size':16,
+        'block_size':128,
+        'n_embd':256,
+        'n_head':4,
+        'n_layer':4,
+        'dropout':0.0,
+    }
+
     if Path("checkpoint.pt").exists():
         print("权重文件存在")
         ckpt=torch.load("checkpoint.pt",map_location="cuda")
@@ -162,7 +164,7 @@ if __name__=="__main__":
         print("未找到权重文件，从头训练")
         model = GPT(GPTConfig(**config)).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)  # AdamW + 3e-4:LLM 默认起手式
-        for step in range(2000):
+        for step in range(10000):
             xb,yb=get_batch(config['block_size'], config['batch_size'], device)
             _,loss=model(xb,yb)
             optimizer.zero_grad(set_to_none=True)
