@@ -47,6 +47,14 @@ def apply_rope(xq:torch.Tensor,xk:torch.Tensor,freqs_cis:torch.Tensor):
     #    .float() 是必须的：复数运算 + 角度精度对数值敏感，低精度会累积误差
     xq_c=torch.view_as_complex(xq.float().reshape(*xq.shape[:-1],-1,2))
     xk_c=torch.view_as_complex(xk.float().reshape(*xk.shape[:-1],-1,2))
+
+    # 2) 广播对齐后做复数乘法 = 旋转（见第三部分：乘 e^{imθ} 就是转 mθ）
+    fc=_reshape_for_broadcast(freqs_cis,xq_c)
+    xq_rot = torch.view_as_real(xq_c * fc).flatten(-2)  # 转回实数并合并回 [B,S,H,D]
+    xk_rot = torch.view_as_real(xk_c * fc).flatten(-2)
+
+    # 3) 转回输入的原始 dtype（比如 bf16），保证和后续算子精度一致
+    return xq_rot.type_as(xq), xk_rot.type_as(xk)
     
 
 
