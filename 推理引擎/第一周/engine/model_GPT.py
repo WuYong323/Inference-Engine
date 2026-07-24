@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from pathlib import Path
 
 from rope import precompute_freqs_cis,apply_rope
-from 第一周.engine.backend import Backend
+from backend import TorchBackend
 
 
 def get_batch(block_size,batch_size,device):
@@ -178,12 +178,12 @@ if __name__=="__main__":
     if Path("checkpoint.pt").exists():
         print("权重文件存在")
         ckpt=torch.load("checkpoint.pt",map_location="cuda")
-        model = GPT(GPTConfig(**ckpt['model_args'])).to(device)
+        model = GPT(GPTConfig(**ckpt['model_args']),TorchBackend).to(device)
         model.load_state_dict(ckpt["model"])
 
     else:
         print("未找到权重文件，从头训练")
-        model = GPT(GPTConfig(**config)).to(device)
+        model = GPT(GPTConfig(**config),TorchBackend).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)  # AdamW + 3e-4:LLM 默认起手式
         for step in range(10000):
             xb,yb=get_batch(config['block_size'], config['batch_size'], device)
