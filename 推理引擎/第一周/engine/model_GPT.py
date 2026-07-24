@@ -6,6 +6,8 @@ import torch.nn.functional as F
 
 from pathlib import Path
 
+from rope import precompute_freqs_cis,apply_rope
+from 第一周.engine.backend import Backend
 
 
 def get_batch(block_size,batch_size,device):
@@ -17,22 +19,33 @@ def get_batch(block_size,batch_size,device):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self,n_embd,dropout,n_head):
+    def __init__(self,n_embd,dropout,n_head,backend):
         super().__init__()
         self.c_attn=nn.Linear(n_embd,3*n_embd,bias=False)
         self.c_proj=nn.Linear(n_embd,n_embd,bias=False)
         self.dropout=nn.Dropout(dropout)
         self.n_embd=n_embd
+        assert n_embd % n_head == 0
         self.n_head=n_head
+        self.backend=backend
 
-    def forward(self,x):
+
+    def forward(self,x,freqs_cis):
         B,T,C=x.shape
         qkv=self.c_attn(x)
         q,k,v=qkv.split(self.n_embd,dim=2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        y=F.scaled_dot_product_attention(q,k,v,is_causal=True)
+        # reshape 成 [B, T, H, D]（注意是 Llama 布局，H 在 D 前）
+        q = q.view(B, T, self.n_head, C // self.n_head)
+        k = k.view(B, T, self.n_head, C // self.n_head)
+        v = v.view(B, T, self.n_head, C // self.n_head)
+
+        # 改动②：在这里接入 RoPE —— 只旋转 Q、K，V 原样不动
+        q, k = apply_rope(q, k, freqs_cis[:T])  # 只取前 T 个位置的旋转因子
+
+        # 转成 [B, H, T, D] 交给注意力算子（对齐 Day1 backend.attention 的布局）
+        q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+
+        y=self.backend.attention(q,k,v,causal=True)
         y=y.transpose(1,2).contiguous().view(B,T,C)
         return self.dropout(self.c_proj(y))
 
@@ -50,31 +63,41 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self,n_embd,dropout,n_head):
+    """改动①：LayerNorm → 走 backend.rmsnorm。从今天起，模型层只认 Backend 接口，
+    不再自己 new 一个 nn.LayerNorm —— 这样 norm 的实现也能被后端替换（Day1 抽象的兑现）。"""
+    def __init__(self,n_embd,dropout,n_head,backend):
         super().__init__()
-        self.ln_1=nn.RMSNorm(n_embd)
-        self.attn=CausalSelfAttention(n_embd,dropout,n_head)
-        self.ln_2=nn.RMSNorm(n_embd)
+        self.backend=backend
+        # RMSNorm 只有一个缩放参数 γ（没有 β），初始化为全 1
+        self.attn_norm_w=nn.Parameter(torch.ones(n_embd))
+        self.ffn_norm_w=nn.Parameter(torch.ones(n_embd))
+        self.attn=CausalSelfAttention(n_embd,dropout,n_head,backend)     # 内部接入 RoPE（见下）
         self.mlp=MLP(n_embd,dropout)
         self.mlp._is_residual_proj=True     #初始化
 
-    def forward(self,x):
-        x=x+self.attn(self.ln_1(x))
-        x=x+self.mlp(self.ln_2(x))
+    def forward(self,x,freqs_cis):
+        # 保持 pre-norm 结构：norm 在子层之前，残差连接不变
+        x=x+self.attn(self.backend.rmsnorm(x,self.attn_norm_w),freqs_cis)
+        x=x+self.mlp(self.backend.rmsnorm(x,self.ffn_norm_w))
         return x
 
 
 class GPT(nn.Module):
-    def __init__(self,config):
+    def __init__(self,config,backend):
         super().__init__()
-        self.transformer=nn.ModuleDict(dict(
-            wte=nn.Embedding(config.vocab_size,config.n_embd),
-            wpe=nn.Embedding(config.block_size,config.n_embd),
-            h=nn.ModuleList([Block(config.n_embd,config.dropout,config.n_head) for _ in range(config.n_layer)]),
-            ln_f=nn.RMSNorm(config.n_embd)
-        ))
+        self.backend=backend
+        self.wte=nn.Embedding(config.vocab_size,config.n_embd)
+        # 改动③：删除绝对位置嵌入 self.wpe！位置信息全交给 RoPE。
+        self.h=nn.ModuleList([Block(config.n_embd,config.dropout,config.n_head) for _ in range(config.n_layer)])
+        self.final_norm_w=nn.Parameter(torch.ones(config.n_embd))
         self.lm_head=nn.Linear(config.n_embd,config.vocab_size,bias=False)
         self.transformer.wte.weight=self.lm_head.weight
+
+        # 预计算旋转因子，注册成 buffer（随模型搬到 GPU，但不是可训练参数）
+        head_dim = config.n_embd // config.n_head
+        # 不存进 checkpoint：它是可复算的常量，存了浪费空间
+        self.register_buffer("freqs_cis",precompute_freqs_cis(head_dim, config.block_size),persistent=False)
+
         self.apply(self._init_weights)      #先从最外层的 GPT 开始，调用 _init_weights( ),遍历所有的子模块
         self.n_layer=config.n_layer
         self.vocab_size=config.vocab_size
@@ -93,12 +116,10 @@ class GPT(nn.Module):
 
     def forward(self,idx,targets=None):
         B,T=idx.shape
-        tok_emb=self.transformer.wte(idx)
-        pos_emb=self.transformer.wpe(torch.arange(T,device=idx.device))
-        x=tok_emb+pos_emb
-        for block in self.transformer.h:
-            x=block(x)
-        x=self.transformer.ln_f(x)
+        x=self.wte(idx)
+        for block in self.h:
+            x=block(x,self.freqs_cis[:T])
+        x=self.backend.rmsnorm(x,self.final_norm_w)
         logits=self.lm_head(x)
         loss=None
         if targets is not None:
