@@ -88,20 +88,19 @@ class GPT(nn.Module):
         self.backend=backend
         self.wte=nn.Embedding(config.vocab_size,config.n_embd)
         # 改动③：删除绝对位置嵌入 self.wpe！位置信息全交给 RoPE。
-        self.h=nn.ModuleList([Block(config.n_embd,config.dropout,config.n_head) for _ in range(config.n_layer)])
+        self.h=nn.ModuleList([Block(config.n_embd,config.dropout,config.n_head,self.backend) for _ in range(config.n_layer)])
         self.final_norm_w=nn.Parameter(torch.ones(config.n_embd))
         self.lm_head=nn.Linear(config.n_embd,config.vocab_size,bias=False)
-        self.transformer.wte.weight=self.lm_head.weight
+        self.wte.weight=self.lm_head.weight
 
         # 预计算旋转因子，注册成 buffer（随模型搬到 GPU，但不是可训练参数）
         head_dim = config.n_embd // config.n_head
         # 不存进 checkpoint：它是可复算的常量，存了浪费空间
         self.register_buffer("freqs_cis",precompute_freqs_cis(head_dim, config.block_size),persistent=False)
-
-        self.apply(self._init_weights)      #先从最外层的 GPT 开始，调用 _init_weights( ),遍历所有的子模块
         self.n_layer=config.n_layer
         self.vocab_size=config.vocab_size
         self.block_size=config.block_size
+        self.apply(self._init_weights)  # 先从最外层的 GPT 开始，调用 _init_weights( ),遍历所有的子模块
 
     def _init_weights(self,module):
         std=0.02
@@ -178,12 +177,12 @@ if __name__=="__main__":
     if Path("checkpoint.pt").exists():
         print("权重文件存在")
         ckpt=torch.load("checkpoint.pt",map_location="cuda")
-        model = GPT(GPTConfig(**ckpt['model_args']),TorchBackend).to(device)
+        model = GPT(GPTConfig(**ckpt['model_args']),TorchBackend()).to(device)
         model.load_state_dict(ckpt["model"])
 
     else:
         print("未找到权重文件，从头训练")
-        model = GPT(GPTConfig(**config),TorchBackend).to(device)
+        model = GPT(GPTConfig(**config),TorchBackend()).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)  # AdamW + 3e-4:LLM 默认起手式
         for step in range(10000):
             xb,yb=get_batch(config['block_size'], config['batch_size'], device)
