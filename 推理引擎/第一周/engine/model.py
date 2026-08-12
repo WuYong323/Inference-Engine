@@ -8,6 +8,7 @@ from pathlib import Path
 
 from rope import precompute_freqs_cis,apply_rope
 from backend import TorchBackend
+from 第一周.engine.backend import Backend
 
 
 def get_batch(block_size,batch_size,device):
@@ -15,6 +16,22 @@ def get_batch(block_size,batch_size,device):
     x=torch.stack([data[i:i+block_size] for i in ix])
     y=torch.stack([data[i+1:i+1+block_size] for i in ix])
     return x.to(device),y.to(device)
+
+
+class SwiGLUFFN(nn.Module):
+    """Llama 风格 FFN。三个矩阵都无 bias（现代 LLM 惯例：bias 收益极小，省掉更简洁）。"""
+    def __init__(self,dim:int,hidden_dim:int,backend):
+        super().__init__()
+        # 命名对齐 Llama 官方：gate_proj / up_proj / down_proj
+        self.gate_proj=nn.Linear(dim,hidden_dim,bias=False)
+        self.up_proj=nn.Linear(dim,hidden_dim,bias=False)
+        self.down_proj=nn.Linear(hidden_dim,dim,bias=False)
+        self.backend=backend
+
+    def forward(self,x):
+        return self.backend.fused_ffn(
+            x,self.gate_proj.weight,self.up_proj.weight,self.down_proj.weight
+        )
 
 
 

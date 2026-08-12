@@ -1,5 +1,5 @@
 import torch
-from 第一周.engine.model_GPT import GPT, GPTConfig
+from 第一周.engine.model import GPT, GPTConfig
 
 
 ckpt=torch.load("checkpoint.pt", map_location="cuda")
