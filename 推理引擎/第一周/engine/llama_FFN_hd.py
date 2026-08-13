@@ -8,4 +8,5 @@ def llama_ffn_hidden_dim(dim:int,multiple_of:int=256,ffn_dim_multiplier:float|No
     hidden=multiple_of*((hidden+multiple_of-1)//multiple_of)
     return hidden
 
-print(llama_ffn_hidden_dim(4096))
+if __name__=="__main__":
+    print(llama_ffn_hidden_dim(4096))
