@@ -178,13 +178,26 @@ class LlamaModel(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens):
+        def temp_topk(logits,temperature=1.0,top_k=None):
+            if temperature==0.0:
+                return logits.argmax(dim=-1,keepdim=True)
+
+            logits=logits/temperature
+            if top_k is not None:
+                k=min(top_k,logits.size(-1))
+                v,_=torch.topk(logits,k)
+                logits[logits<v[:,[-1]]]=float("-inf")
+
+            probs=F.softmax(logits,dim=-1)
+            return torch.multinomial(probs,num_samples=1)
+
         self.eval()
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.block_size:]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+            idx_next = temp_topk(logits,0.8,200)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
