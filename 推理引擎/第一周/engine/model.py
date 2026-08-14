@@ -6,10 +6,10 @@ import torch.nn.functional as F
 
 from pathlib import Path
 
-from rope import precompute_freqs_cis,apply_rope
-from backend import TorchBackend
-from 第一周.engine.backend import Backend
-from 第一周.engine.llama_FFN_hd import llama_ffn_hidden_dim
+from 推理引擎.第一周.engine.rope import precompute_freqs_cis, apply_rope
+from 推理引擎.第一周.engine.backend import TorchBackend
+from 推理引擎.第一周.engine.backend import Backend
+from 推理引擎.第一周.engine.llama_FFN_hd import llama_ffn_hidden_dim
 
 
 def get_batch(block_size,batch_size,device):
@@ -148,6 +148,20 @@ class LlamaModel(nn.Module):
         self.n_layer = config.n_layer
         self.vocab_size = config.vocab_size
         self.block_size = config.block_size
+        self.apply(self._init_weights)
+
+
+    def _init_weights(self,module):
+        std=0.02
+        if isinstance(module,nn.Linear):
+            if hasattr(module,"_is_residual_proj"):
+                std*=(2*self.n_layer)**-0.5
+            nn.init.normal_(module.weight,mean=0.0,std=std)         #将一个张量（Tensor）原地（in-place）填充为服从正态（高斯）分布的随机数。
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module,nn.Embedding):
+            nn.init.normal_(module.weight,mean=0.0,std=std)
+
 
     def forward(self,tokens,targets=None):
         B,T=tokens.shape
