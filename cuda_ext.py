@@ -20,11 +20,11 @@ torch.utils.cpp_extension.load 是 PyTorch 提供的工具：
 verbose=True：编译时会在控制台输出详细的编译命令和日志，便于排查链接或语法错误
 """
 ext = load(
-    name="kernels",  # 所有 kernel 编译进这一个扩展
+    name="_kernels",  # 所有 kernel 编译进这一个扩展（私有二进制，外面用 kernels.py 包一层）
     sources=[
         "cuda_ext/bindings.cpp",        # 连接 C++ 和 Python 的胶水代码
-        "cuda_ext/vector_add.cpp",      # 调用 CUDA 内核的 C++ 封装函数
-        "cuda_ext/vector_add_kernel.cu",    # 实际的 GPU 内核代码（.cu）
+        "cuda_ext/vector_add/vector_add.cpp",      # 调用 CUDA 内核的 C++ 封装函数
+        "cuda_ext/vector_add/vector_add_kernel.cu",    # 实际的 GPU 内核代码（.cu）
         # 新 kernel 的 .cpp / .cu 加在这里
     ],
     extra_cflags=["/utf-8"],
