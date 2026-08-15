@@ -1,6 +1,6 @@
 import torch
-from 推理引擎.第一周.engine.backend import TorchBackend
-from 推理引擎.第一周.engine.model import LlamaModel
+from 推理引擎.engine.backend import TorchBackend
+from 推理引擎.engine.model import LlamaModel
 
 
 class config:
@@ -39,7 +39,7 @@ def test_forward_shape_and_finite():
 def count_params_by_formula(c:config)-> int:
     """体检②：按架构公式手算参数量（权重 tying：embedding 只算一次）。
         把这个函数当'架构自测'——它逼你写清每一块到底有多少参数。"""
-    from 推理引擎.第一周.engine.model import llama_ffn_hidden_dim
+    from 推理引擎.engine.model import llama_ffn_hidden_dim
     h=llama_ffn_hidden_dim(c.n_embd,c.multiple_of)
 
     emb=c.vocab_size*c.n_embd

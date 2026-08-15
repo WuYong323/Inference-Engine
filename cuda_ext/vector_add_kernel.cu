@@ -1,6 +1,9 @@
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAException.h>
 
+// <cuda_runtime.h> 声明了调用的一切底层 CUDA 函数内存管理：cudaMalloc、cudaFree;数据搬运：cudaMemcpy;类型定义：cudaError_t（错误码类型）
+// <c10/cuda/CUDAException.h> 专门用来帮助在 C++ 层优雅地捕获 CUDA 错误
+
 // simple vector add CUDA kernel
 __global__ void vector_add_kernel(const float* a, const float* b, float* c, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

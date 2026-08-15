@@ -1,5 +1,5 @@
 import torch
-from 推理引擎.第一周.engine.rope import precompute_freqs_cis,apply_rope
+from 推理引擎.engine.rope import precompute_freqs_cis,apply_rope
 
 
 def _rope_single(vec:torch.Tensor,pos:int,freqs_cis:torch.Tensor)->torch.Tensor:

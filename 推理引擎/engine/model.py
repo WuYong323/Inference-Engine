@@ -6,10 +6,9 @@ import torch.nn.functional as F
 
 from pathlib import Path
 
-from 推理引擎.第一周.engine.rope import precompute_freqs_cis, apply_rope
-from 推理引擎.第一周.engine.backend import TorchBackend
-from 推理引擎.第一周.engine.backend import Backend
-from 推理引擎.第一周.engine.llama_FFN_hd import llama_ffn_hidden_dim
+from 推理引擎.engine.rope import precompute_freqs_cis, apply_rope
+from 推理引擎.engine.backend import TorchBackend
+from 推理引擎.engine.llama_FFN_hd import llama_ffn_hidden_dim
 
 
 def get_batch(block_size,batch_size,device):
@@ -281,7 +280,7 @@ if __name__=="__main__":
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    with open("遮天.txt","r",encoding="gbk") as f:
+    with open("遮天.txt", "r", encoding="gbk") as f:
         words=f.read()
     chars = sorted(list(set(words)))
     vocab_size = len(chars)
@@ -303,13 +302,13 @@ if __name__=="__main__":
         'max_seq_len':1000,
     }
 
-    if Path("checkpoint_GPT.pt").exists() and choose=="GPT":
+    if Path("checkpoint_GPT.pt").exists() and choose== "GPT":
         print("权重文件存在")
-        ckpt=torch.load("checkpoint_GPT.pt",map_location="cuda")
+        ckpt=torch.load("checkpoint_GPT.pt", map_location="cuda")
         model = GPT(Config(**ckpt['model_args']), TorchBackend()).to(device)
         model.load_state_dict(ckpt["model"])
 
-    elif Path("checkpoint_Llama.pt").exists() and choose=="Llama":
+    elif Path("checkpoint_Llama.pt").exists() and choose== "Llama":
         ckpt = torch.load("checkpoint_Llama.pt", map_location="cuda")
         model = LlamaModel(Config(**ckpt['model_args']), TorchBackend()).to(device)
         model.load_state_dict(ckpt["model"])
@@ -345,10 +344,10 @@ if __name__=="__main__":
         }
 
         if choose=="GPT":
-            torch.save(save_dict,"checkpoint_GPT.pt")
+            torch.save(save_dict, "checkpoint_GPT.pt")
             print("模型已保存为 checkpoint_GPT.pt")
         elif choose=="Llama":
-            torch.save(save_dict,"checkpoint_Llama.pt")
+            torch.save(save_dict, "checkpoint_Llama.pt")
             print("模型已保存为 checkpoint_Llama.pt")
 
     #输出
