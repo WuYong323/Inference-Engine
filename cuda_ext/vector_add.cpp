@@ -23,6 +23,4 @@ torch::Tensor vector_add(torch::Tensor a, torch::Tensor b) {
     return c;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("vector_add", &vector_add, "vector add (CUDA)");
-}
+// PYBIND11_MODULE 统一放在 bindings.cpp,这里只实现 wrapper

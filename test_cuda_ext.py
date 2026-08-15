@@ -6,8 +6,13 @@ from torch.utils.cpp_extension import load
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")  # RTX 5060 = sm_120
 
 ext = load(
-    name="vector_add_ext",
-    sources=["cuda_ext/vector_add.cpp", "cuda_ext/vector_add_kernel.cu"],
+    name="my_kernels",  # 所有 kernel 编译进这一个扩展
+    sources=[
+        "cuda_ext/bindings.cpp",
+        "cuda_ext/vector_add.cpp",
+        "cuda_ext/vector_add_kernel.cu",
+        # 新 kernel 的 .cpp / .cu 加在这里
+    ],
     extra_cuda_cflags=["-O3", "-Xcompiler", "/utf-8"],
     verbose=True,
 )
