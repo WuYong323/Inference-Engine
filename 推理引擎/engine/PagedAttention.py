@@ -1,5 +1,4 @@
-# 演示 PagedAttention 的显存管理骨架
-from numpy.ma.core import append
+  # 演示 PagedAttention 的显存管理骨架
 
 
 class BlockAllocator:
