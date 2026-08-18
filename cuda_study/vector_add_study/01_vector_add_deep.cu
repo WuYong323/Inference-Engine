@@ -6,6 +6,11 @@
 // 调试: compute-sanitizer ./01_vector_add_deep
 // ============================================================================
 
+// nvcc -O3 -arch=sm_90 -Xptxas -v -c 02_memory_access.cu
+// 日常开发与调试：建议使用 -O0（默认）或 -O1  性能测试与生产部署：-O2 通常是最佳且最安全的选择    追求极致性能：如果对性能有极致要求，并且已经过充分测试，可以尝试 -O3
+
+
+
 #include <cstdio>       //标准输入输出库
 #include <cstdlib>      //C 标准通用工具库
 #include <cmath>
