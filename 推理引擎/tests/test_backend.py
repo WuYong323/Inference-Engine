@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from 第一周.engine.backend import TorchBackend
+from 推理引擎.engine.backend import (TorchBackend)
 
 
 

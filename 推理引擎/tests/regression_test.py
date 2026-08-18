@@ -1,9 +1,9 @@
 import torch
-from 第一周.engine.model import GPT, GPTConfig
+from 推理引擎.engine.model import GPT, Config
 
 
 ckpt=torch.load("checkpoint.pt", map_location="cuda")
-model = GPT(GPTConfig(**ckpt["model_args"]))
+model = GPT(Config(**ckpt["model_args"]))
 model.load_state_dict(ckpt["model"])
 model.eval().cuda()
 
