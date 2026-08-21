@@ -18,6 +18,8 @@ from dataclasses import dataclass,asdict,field      # 专门用来优雅地定�
 from typing import Callable,Any                     # 提供类型提示（Type Hints），给代码加上“说明书”和“边界约束”。
 
 import torch
+from mpmath import rand
+from torch._C import device, dtype
 
 # ---------------------------------------------------------------------------
 # 硬件常数：对标必须有「尺子的刻度」。数值来自官方规格，跑在别的卡上要改。
@@ -25,6 +27,7 @@ import torch
 HW={
     "NVIDIA H100 80G HBM3": dict(hbm_gbs=3350.0,bf16_tflops=989.0),   # SXM, 稠密算力
     "NVIDIA H100 PCIe":     dict(hbm_gbs=2000.0,bf16_tflops=756.0),
+    "NVIDIA RTX 5060":      dict(hbm_gbs=384.0,  bf16_tflops=14.98),
 }
 
 
@@ -111,6 +114,7 @@ def timeit(fn:Callable[[],Any],warmup:int=20,iters:int=100,flush_l2:bool=True,de
            times[int(0.9*len(times))-1])
 
 
+# *: 表示之后的参数必须以关键字形式传递
 def bench_op(name:str,fn:Callable[[],Any],*,bytes_moved:int=0,flops:int=0,**kwargs) -> BenchResult:
     """测一个算子，并直接换算成「离硬件极限多远」。"""
     med,p10,p90=timeit(fn,**kwargs)
@@ -130,13 +134,72 @@ def bench_op(name:str,fn:Callable[[],Any],*,bytes_moved:int=0,flops:int=0,**kwar
 
 
 
+# ---------------------------------------------------------------------------
+# 正确性：三尺子
+# ---------------------------------------------------------------------------
+def compare(out:torch.Tensor,ref:torch.Tensor,name:str,atol:float=1e-3,rtol:float=1e-3) -> dict:
+    """三尺子验误差。为什么要三把：
+      allclose 只给 True/False，FAIL 了不知道差多少；
+      cosine   对整体「方向」敏感 —— 掉到 0.99 以下通常是算法写错而非精度问题；
+      max_abs/max_rel 定位最坏点 —— fp16 累加误差通常 max_rel 大但 cosine≈1。
+    """
+    out32,ref32=out.float(),ref.float()
+    diff=(out32-ref32).abs()
+    cos=torch.nn.functional.cosine_similarity(
+        out32.flatten(),ref32.flatten(),dim=0).item()
+    rel=(diff/ref32.abs().clamp_min(1e-6)).max().item()         # 计算最大相对误差
+    rec=dict(name=name,allclose=bool(torch.allclose(out32,ref32,atol=atol,rtol=rtol)),
+             cosine=cos,max_abs=diff.max().item(),max_rel=rel)
+    print(f"[{name}] allclose={rec['allclose']} cosine={cos:.6f} "
+          f"max_abs={rec['max_abs']:.2e} max_rel={rel:.2e}")
+    return rec
 
 
 
+def report(results:list[BenchResult],path:str|None=None)->None:
+    base=results[0].ms_median
+    print(f"\n{'op':<28}{'ms':>9}{'p10-p90':>16}{'GB/s':>9}{'%peak':>8}{'speedup':>9}")
+    for r in results:
+        print(f"{r.name:<28}{r.ms_median:>9.4f}"
+              f"{f'{r.ms_p10:.3f}-{r.ms_p90:.3f}':>16}"
+              f"{r.hbm_gbs:>9.0f}{r.pct_of_peak_bw:>7.1f}%{base / r.ms_median:>8.2f}x")
+    if path:                                    # 落盘：里程碑要「可复现」
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([asdict(r) for r in results], f, indent=2, ensure_ascii=False)
+        print(f"\n-> saved {path}")
 
 
+# ---------------------------------------------------------------------------
+# 自测：用 RMSNorm 跑通全流程
+# ---------------------------------------------------------------------------
+if __name__=="__main__":
+    torch.manual_seed(0)
+    device="cuda" if torch.cuda.is_available() else "cpu"
+    B,T,D=8,2048,4098
 
+    x=torch.randn(B,T,D,device=device,dtype=torch.bfloat16)
+    w=torch.randn(D,device=device,dtype=torch.bfloat16)
 
+    def rmsnorm_torch(x,w,eps=1e-6):
+        h=x.float()
+        h=h*torch.rsqrt(h.pow(2).mean(-1,keepdim=True)+eps)
+        return (h*w.float()).to(x.dtype)
+
+    ref=rmsnorm_torch(x,w)
+    compare(rmsnorm_torch(x,w),ref,"torch-eager")    # 自比：确认 harness 本身没问题
+
+    # RMSNorm 的访存下界：读 x + 写 y（权重 D 个元素可忽略）
+    nbytes=2*x.numel()*x.element_size()
+    res=[bench_op("rmsnorm/eager",lambda :rmsnorm_torch(x,w),bytes_moved=nbytes)]
+
+    compiled=torch.compile(rmsnorm_torch)
+    compiled(x,w)                                               # 触发编译，别把编译时间算进去
+    compare(compiled(x,w),ref,"torch-compile")
+    res.append(bench_op("rmsnorm/compile",lambda :compiled(x,w),bytes_moved=nbytes))
+
+    report(res,"logs/w1d2_rmsnorm_baseline.json")
+    # 预期：eager 因为多次读写中间量，%peak 明显低于 compile（融合后接近纯访存下界）。
+    # 这个 %peak 差距，就是 Day2 学的「访存才是瓶颈」在引擎层面的第一次现形。
 
 
 

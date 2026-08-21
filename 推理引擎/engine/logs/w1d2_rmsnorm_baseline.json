@@ -1,0 +1,36 @@
+[
+  {
+    "name": "rmsnorm/eager",
+    "ms_median": 8.124144077301025,
+    "ms_p10": 8.07049560546875,
+    "ms_p90": 8.165760040283203,
+    "bytes_moved": 268566528,
+    "flops": 0,
+    "hbm_gbs": 33.057824362123114,
+    "pct_of_peak_bw": 8.608808427636228,
+    "tflops": 0.0,
+    "bound": "",
+    "extra": {
+      "arithmetic_intensity": 0.0,
+      "ridge_point": 39.010416666666664,
+      "gpu": "NVIDIA GeForce RTX 5060 Laptop GPU"
+    }
+  },
+  {
+    "name": "rmsnorm/compile",
+    "ms_median": 0.8303200006484985,
+    "ms_p10": 0.8042240142822266,
+    "ms_p90": 0.8708159923553467,
+    "bytes_moved": 268566528,
+    "flops": 0,
+    "hbm_gbs": 323.4494264744237,
+    "pct_of_peak_bw": 84.23162147771451,
+    "tflops": 0.0,
+    "bound": "",
+    "extra": {
+      "arithmetic_intensity": 0.0,
+      "ridge_point": 39.010416666666664,
+      "gpu": "NVIDIA GeForce RTX 5060 Laptop GPU"
+    }
+  }
+]
