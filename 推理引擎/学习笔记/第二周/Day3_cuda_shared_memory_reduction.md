@@ -524,7 +524,7 @@ __syncthreads();              // 所有线程一个不少
 ### 4.3 跑起来 + 预期输出
 
 ```bash
-nvcc -O3 -arch=sm_90 -lineinfo -Xptxas -v -o blockreduce 03_block_reduce.cu
+nvcc -O3 -arch=sm_90 -lineinfo -Xptxas -v -o blockreduce block_reduce.cu
 ./blockreduce
 ```
 
