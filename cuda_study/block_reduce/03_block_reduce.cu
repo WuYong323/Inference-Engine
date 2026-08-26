@@ -44,7 +44,7 @@
 // ---------------------------------------------------------------------------
 // 0. 错误检查宏（沿用 Day2）：CUDA API 全部返回错误码，不查 = 错了也不知道
 // ---------------------------------------------------------------------------
-#define CUDA_CHECK(call)
+#define CUDA_CHECK(call)                                            \
     do{                                                             \
         cudaError_t err_=(call);                                    \
         if(err_!=cudaSuccess){                                      \
@@ -100,7 +100,7 @@ __global__ void reduce_shared_serial(const float* __restrict__ in,float* __restr
     s[tid]=sum;
 
     // 段三： 同步 —— "都写完了，才开始加"
-    __syncthreads;
+    __syncthreads();
 
     // 朴素合并：只有 thread0 干活，其余 255 个线程干等 → 并行度 1/256
     // 故意先写这个「笨版本」，之后升级成树形，才能量出差多少
@@ -117,7 +117,7 @@ __global__ void reduce_shared_serial(const float* __restrict__ in,float* __restr
 //     warp0 里的 thread0 常常跑在前面，读到 warp1..7 还没写的 shared（未初始化内存）。
 //     所以：不要用「跑一遍对了」来验证同步，要用 racecheck 工具确定性地抓。
 // ===========================================================================
-__global__ void reduce_shared_nosync(const float* __restrict_ in,float* __restrict__ partial,size_t n){
+__global__ void reduce_shared_nosync(const float* __restrict__ in,float* __restrict__ partial,size_t n){
     __shared__ float s[BLOCK];
     const unsigned tid=threadIdx.x;
     const size_t gsize=(size_t)gridDim.x*blockDim.x;
@@ -189,7 +189,7 @@ __global__ void reduce_tree_atomic_block(const float* __restrict__ in,float* out
     s[tid]=sum;
     __syncthreads();
 
-    for(unsigned off=BLOCK/23;off>0;off>>=1){
+    for(unsigned off=BLOCK/2;off>0;off>>=1){
         if(tid<off) s[tid]+=s[tid+off];
         __syncthreads();
     }
@@ -221,6 +221,251 @@ __global__ void reduce_dynshared_tree(const float* __restrict__ in,float* __rest
     }
     if(tid==0) partial[blockIdx.x]=sdyn[0];
 }
+
+// ===========================================================================
+// 计时工具（预热 / 多次取平均 / 显式同步）
+// ===========================================================================
+struct Timer{
+    cudaEvent_t s,e;
+    Timer() {
+        CUDA_CHECK(cudaEventCreate(&s));
+        CUDA_CHECK(cudaEventCreate(&e));
+    }
+    ~Timer(){
+        CUDA_CHECK(cudaEventDestroy(s));
+        CUDA_CHECK(cudaEventDestroy(e));
+    }
+    void tic(){
+        CUDA_CHECK(cudaEventRecord(s));
+    }
+    float toc(){
+        CUDA_CHECK(cudaEventRecord(e));
+        CUDA_CHECK(cudaEventSynchronize(e));
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms,s,e));
+        return ms;
+    }
+};
+
+template<typename F>
+static float bench(F&& launch,int warmup,int iters){
+    for(int i=0;i<warmup;++i) launch();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
+    Timer t;
+    t.tic();
+    for(int i=0;i<iters;++i) launch();
+    float ms=t.toc()/iters;
+    CUDA_CHECK(cudaGetLastError());
+    return ms;
+}
+
+int main(int argc,char** argv){
+    // ---------------- 设备信息 ----------------
+    int dev=0;
+    cudaDeviceProp p;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    CUDA_CHECK(cudaGetDeviceProperties(&p,dev));
+    printf("GPU: %s | SM=%d | sharedMem/SM=%.0f KB | sharedMem/block(default)=%.0f KB\n",
+           p.name, p.multiProcessorCount,
+           p.sharedMemPerMultiprocessor / 1024.0, p.sharedMemPerBlock / 1024.0);
+
+    int shift=(argc>1)?atoi(argv[1]):27;          // 默认 n = 1<<27 = 512 MB
+    bool use_rand=(argc>2)&&(strcmp(argv[2],"rand")==0);
+    size_t n=(size_t)1<<shift;
+    size_t bytes=n*sizeof(float);
+    printf("n = %zu floats (%.0f MB), data = %s\n\n",
+           n, bytes / 1048576.0, use_rand ? "uniform random [0,1)" : "all 1.0f");
+
+    // ---------------- 数据准备 + 双精度参考值 ----------------
+    float* h_in=(float*)malloc(bytes);
+    double ref_double=0.0;
+    float ref_float_serial=0;
+    srand(1234);
+    for(size_t i=0;i<n;++i){
+        h_in[i]=use_rand?(float)rand()/(float)RAND_MAX:1.0f;
+        ref_double+=(double)h_in[i];
+        ref_float_serial+=h_in[i];
+    }
+    printf("[CPU 参考] double 串行 = %.6f\n", ref_double);
+    printf("[CPU 参考] float  串行 = %.6f   (相对误差 %.3e)\n",
+           ref_float_serial, fabs(ref_float_serial - ref_double) / ref_double);
+    if(!use_rand&&n>(1u<<24)){
+        printf("           注意卡在 16777216 = 2^24 附近了：float 尾数只有 24 位，\n"
+               "             当 acc 大到 2^24 时，acc + 1.0f 舍入回 acc —— 串行加法,加不动了。\n");
+    }
+    printf("\n");
+
+    // ---------------- 显存分配 ----------------
+    const size_t gridP=(size_t)p.multiProcessorCount*8;   // 每 SM 8 个 block，够铺满
+    float* d_in=nullptr;
+    float* d_partial=nullptr;
+    float* d_out=nullptr;
+    CUDA_CHECK(cudaMalloc(&d_in,bytes));
+    CUDA_CHECK(cudaMalloc(&d_partial,gridP*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_out,sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_in,h_in,bytes,cudaMemcpyHostToDevice));       // 唯一一次过 PCIe
+
+    // 规约是纯 memory-bound：有用字节 = 读一遍输入。用它算有效带宽和 %peak
+    const double gb=(double)bytes/1e9;
+    const double peak_bw_gbs=384.0;        // H100 SXM HBM3 理论峰值，换卡请改  (H100 SXM HBM3 理论峰值为3350.0)
+
+    struct Row{
+        const char* name;
+        float ms;
+        double val;
+        double relerr;
+    };
+    Row rows[5];
+    float h_res=0.0f;
+    auto grab=[&](float* dev_scalar){                 // 取回单个标量结果
+        CUDA_CHECK(cudaMemcpy(&h_res,dev_scalar,sizeof(float),cudaMemcpyDeviceToHost));
+        return (double)h_res;
+    };
+    auto relerr=[&](double v){
+        return fabs(v-ref_double)/ref_double;
+    };
+
+    // 把 gridP 个 partial 合成 1 个（复用同一个 kernel，1 个 block 足够）
+    auto pass2=[&](){
+        reduce_shared_tree<<<1,BLOCK>>>(d_partial,d_out,gridP);
+    };
+
+    // ---- (0) atomic per element：慢，iters 调小防止等太久 ----
+    {
+        size_t gridA=(n+BLOCK-1)/BLOCK;
+        auto run=[&]{
+            CUDA_CHECK(cudaMemsetAsync(d_out,0,sizeof(float)));      // atomic 前必须清零
+            reduce_atomic_per_element<<<gridA,BLOCK>>>(d_in,d_out,n);
+        };
+        rows[0]={"atomic per element (BAD)",bench(run,1,3),0,0};
+        run();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        rows[0].val=grab(d_out);
+        rows[0].relerr=relerr(rows[0].val);
+    }
+
+    // ---- (1) shared + serial merge 保底 ----
+    {
+        auto run=[&]{
+            reduce_shared_serial<<<gridP,BLOCK>>>(d_in,d_partial,n);
+            pass2();
+        };
+        rows[1]={"shared + serial merge",bench(run,5,20),0,0};
+        run();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        rows[1].val=grab(d_out);
+        rows[1].relerr=relerr(rows[1].val);
+    }
+
+    // ---- (2) 漏掉 __syncthreads 的版本：看错没错（可能对） ----
+    {
+        auto run=[&]{
+            reduce_shared_nosync<<<gridP,BLOCK>>>(d_in,d_partial,n);
+            pass2();
+        };
+        rows[2]={"NO __syncthreads (BAD)",bench(run,5,20),0,0};
+        run();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        rows[2].val=grab(d_out);
+        rows[2].relerr=relerr(rows[2].val);
+    }
+
+    // ---- (3) 树形规约 + 确定性第二趟 ----
+    {
+        auto run=[&]{
+            reduce_shared_tree<<<gridP,BLOCK>>>(d_in,d_partial,n);
+            pass2();
+        };
+        rows[3]={"tree + 2nd pass (det.)",bench(run,5,20),0,0};
+        run();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        rows[3].val=grab(d_out);
+        rows[3].relerr=relerr(rows[3].val);
+    }
+
+    // ---- (4) 树形 + 每 block 一次 atomicAdd（不可复现） ----
+    {
+        auto run=[&]{
+            CUDA_CHECK(cudaMemsetAsync(d_out,0,sizeof(float)));
+            reduce_tree_atomic_block<<<gridP,BLOCK>>>(d_in,d_out,n);
+        };
+        rows[4]={"tree + block atomic",bench(run,5,20),0,0};
+        run();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        rows[4].val=grab(d_out);
+        rows[4].relerr=relerr(rows[4].val);
+    }
+
+    // ---------------- 结果表 ----------------
+    printf("%-28s %10s %12s %10s %18s %12s\n",
+           "kernel", "time(ms)", "eff.BW", "%peak", "result", "rel.err");
+    for (auto& r : rows) {
+        double bw = gb / (r.ms / 1e3);
+        printf("%-28s %10.3f %10.0f GB/s %9.1f%% %18.4f %12.3e\n",
+               r.name, r.ms, bw, 100.0 * bw / peak_bw_gbs, r.val, r.relerr);
+    }
+
+    // ---------------- 不可复现性实验：同一个 kernel 连跑 5 次，看结果变不变 ----------------
+    printf("\n[determinism] tree+block atomic 连跑 5 次（观察最后几位是否抖动）:\n");
+    for (int k = 0; k < 5; ++k) {
+        CUDA_CHECK(cudaMemset(d_out, 0, sizeof(float)));
+        reduce_tree_atomic_block<<<gridP, BLOCK>>>(d_in, d_out, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        printf("   run %d: %.8f\n", k, grab(d_out));
+    }
+    printf("[determinism] tree+2nd pass 连跑 5 次（应当每次完全一致）:\n");
+    for (int k = 0; k < 5; ++k) {
+        reduce_shared_tree<<<gridP, BLOCK>>>(d_in, d_partial, n);
+        pass2();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        printf("   run %d: %.8f\n", k, grab(d_out));
+    }
+
+    // ---------------- 动态 shared memory 版本 sanity ----------------
+    reduce_dynshared_tree<<<gridP,BLOCK,BLOCK*sizeof(float)>>>(d_in,d_partial,n);
+    pass2();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    printf("\n[dynamic shared] result = %.4f (rel.err %.3e)\n",
+           grab(d_out), relerr(grab(d_out)));
+
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_partial));
+    CUDA_CHECK(cudaFree(d_out));
+    free(h_in);
+    return 0;
+}
+
+// ============================================================================
+// 附录：两个死锁样例（看懂即可）
+//
+// 样例一：divergent barrier —— barrier 写进了不是所有线程都会进的分支
+//   __global__ void deadlock_v1(float* a) {
+//       __shared__ float s[BLOCK];
+//       int tid = threadIdx.x;
+//       if (tid < 128) {          // 只有一半线程进来
+//           s[tid] = a[tid];
+//           __syncthreads();      // ← 另一半线程永远不会到达这个 barrier
+//       }
+//   }
+//   官方原话（CUDA C++ Programming Guide）：__syncthreads() 允许出现在条件分支里，
+//   但【条件必须在整个 block 内取值一致】，否则「很可能挂死或产生意外副作用」。
+//
+// 样例二：early return —— 边界检查用 return，等价于样例一
+//   __global__ void deadlock_v2(const float* in, float* out, size_t n) {
+//       __shared__ float s[BLOCK];
+//       size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+//       if (idx >= n) return;     // ← 尾块里越界的线程直接退出
+//       s[threadIdx.x] = in[idx];
+//       __syncthreads();          // ← 语义上已经不完整了
+//       ...
+//   }
+// 正确写法就是本文件 kernel(1) 的做法：
+//      用单位元占位（sum = 0.0f），让所有线程都走完全程，边界只影响「加了什么」，
+//      不影响「谁到达 barrier」。规约里，边界处理 = 补单位元，不是 return。
+// ============================================================================
+
+
 
 
 
