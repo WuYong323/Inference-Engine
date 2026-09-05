@@ -501,7 +501,32 @@ int main(int argc,char** argv){
     printf("n = %zu floats (%.1f MB), data = %s\n\n",
            n, bytes / 1048576.0, use_rand ? "uniform random [0,1)" : "all 1.0f");
 
-    // ---------------- 数据 + double 参考真值（Day3 的规矩：参考值必须更高精度）----------
+    // ---------------- 数据 + double 参考真值（参考值必须更高精度）----------
+    float* h_in=(float*)malloc(bytes);
+    double ref=0.0;
+    srand(1234);
+    for(size_t i=0;i<n;++i){
+        h_in[i]=use_rand?(float)rand()/(float)RAND_MAX:1.0f;
+        ref+=(double)h_in[i];
+    }
+    printf("[参考真值] double 串行 = %.6f\n\n", ref);
+
+    const size_t gridP=(size_t)p.multiProcessorCount*8;   // 厚归约：每 SM 8 个 block
+    const size_t gridT=n/BLOCK;
+    const size_t maxGrid=(gridP>gridT)?gridP:gridT;
+
+    float* d_in=nullptr;
+    float* d_partial=nullptr;
+    float* d_out=nullptr;
+    CUDA_CHECK(cudaMalloc(&d_in,bytes));
+    CUDA_CHECK(cudaMalloc(&d_partial,maxGrid*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_out,sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_in,h_in,bytes,cudaMemcpyHostToDevice));
+
+    const double gb=(double)bytes/1e9;
+    const double peak_bw=3350.0;               // H100 SXM HBM3 理论峰值 GB/s，换卡请改
+
+    // 第二趟合并：把 grid 个 partial 加成 1 个（1 个 block 足够，固定顺序 → 可复现）
 }
 
 
