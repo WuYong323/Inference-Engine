@@ -597,7 +597,7 @@ __device__ __forceinline__ float block_reduce_sum(float v) {
 
 ```bash
 # 编译（-lineinfo 让 ncu/sanitizer 能对回源码行；-Xptxas -v 看寄存器和 shared 用量）
-nvcc -O3 -arch=sm_90 -lineinfo -Xptxas -v -o treereduce 04_tree_reduction.cu
+nvcc -O3 -arch=sm_90 -lineinfo -Xptxas -v -o treereduce 04_tree_reduction.cu.cu
 
 # 主实验（默认 n = 1<<27 = 512 MB）
 ./treereduce
@@ -980,7 +980,7 @@ class TorchBackend(Backend):
           核心 = 一次「平方和归约」+ 一次「广播缩放」，就是 Day4 的 block_reduce_sum
           把 sum 换成 sum of squares。
           排布：一个 block 负责一行（一个 token 的 hidden 向量），grid = 行数。
-          归约实现用两级 warp shuffle（04_tree_reduction.cu 的 block_reduce_sum），
+          归约实现用两级 warp shuffle（04_tree_reduction.cu.cu 的 block_reduce_sum），
           不要用 shared 树形版 —— 实测 shared 流量差两个数量级。
           待实测的设计决策：x 读两遍（靠 cache）vs 第一遍暂存寄存器/shared。
           H=4096 时寄存器方案要 16 个 float/线程，可能压 occupancy —— A/B 实测决定。
