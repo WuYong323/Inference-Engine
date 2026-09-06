@@ -23,9 +23,13 @@
 //
 // 环境要求：CUDA 12.4；显存 ≥ 2 GB（默认输入 n = 1<<27 = 512 MB）
 // 编译：
-//   nvcc -O3 -arch=sm_120 -lineinfo -Xptxas -v -o 04_tree_reduction 04_tree_reduction.cu
+//   nvcc -O3 -arch=sm_120 -lineinfo -Xptxas -v -Xcompiler="/utf-8 /Zc:preprocessor /std:c++17" -o 04_tree_reduction 04_tree_reduction.cu
 //     -lineinfo  : ncu / compute-sanitizer 能把结果对回源码行
 //     -Xptxas -v : 打印每个 kernel 的寄存器用量 + shared memory 用量
+//     -Xcompiler="/utf-8 /Zc:preprocessor /std:c++17" :
+//          /utf-8   源文件和执行字符集都采用 UTF-8 编码。
+//          /Zc:preprocessor   强制 MSVC 使用 符合 C++ 标准的现代预处理器
+//          /std:c++17   让 MSVC 在编译主机代码时采用 C++17 标准
 // 运行：
 //   ./04_tree_reduction              # 默认 n=1<<27，全 1.0f 数据
 //   ./04_tree_reduction 24 rand      # n=1<<24，随机数据（看相对误差而不是整数值）
@@ -54,15 +58,15 @@
 // ---------------------------------------------------------------------------
 // 错误检查宏（沿用 Day2/Day3）：CUDA API 全都靠返回值报错，不查 = 错了也不知道
 // ---------------------------------------------------------------------------
-#define CUDA_CHECK(call)
-    do {
-        cudaError_t err_=(call);
-        if(err_!=cudaSuccess){
-            fprintf(stderr,"[CUDA ERROR] %s:%d   %s\n",
-                    __FILE__,__LINE__,cudaGetErrorString(err_));
-            exit(EXIT_FAILURE);
-        }
-    } while(0)
+#define CUDA_CHECK(call)                                            \
+    do {                                                            \
+        cudaError_t err_=(call);                                    \
+        if(err_!=cudaSuccess){                                      \
+            fprintf(stderr,"[CUDA ERROR] %s:%d   %s\n",             \
+                    __FILE__,__LINE__,cudaGetErrorString(err_));    \
+            exit(EXIT_FAILURE);                                     \
+        }                                                           \
+    } while(0);
 
 // 一个 block 多少线程。必须是 2 的幂：树形折半靠它才不会漏元素
 #define BLOCK 256
@@ -214,7 +218,7 @@ __global__ void reduce_interleave_conf(const float* __restrict__ in,float* __res
 // ===========================================================================
 __global__ void reduce_tree_seq(const float* __restrict__ in,float* __restrict__ partial,size_t n){
     __shared__ float s[BLOCK];
-    const unsigned tid=threadIdx.x
+    const unsigned tid=threadIdx.x;
     const size_t gsize=(size_t)gridDim.x*blockDim.x;
 
     float sum=0.0f;
@@ -348,7 +352,7 @@ __global__ void bank_probe(float* __restrict__ out,int iters) {
 // ===========================================================================
 // 实验 D 用：RMSNorm 的行归约三版本
 //
-// RMSNorm 的定义：y = x / sqrt(mean(x²) + eps) * w
+// RMSNorm 的定义：y = x / sqrt(mean(x?) + eps) * w
 // 拆成三步：① 对一行的 H 个元素求平方和（归约）
 //         ② 由平方和算出缩放系数，广播给全行所有线程
 //         ③ 每个元素乘缩放系数和权重
@@ -490,9 +494,11 @@ int main(int argc,char** argv){
     cudaDeviceProp p;
     CUDA_CHECK(cudaGetDevice(&dev));
     CUDA_CHECK(cudaGetDeviceProperties(&p,dev));
+    int clock_khz=0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz,cudaDevAttrClockRate,dev));
     printf("GPU: %s | SM=%d | shared/SM=%.0f KB | clock=%.2f GHz\n",
            p.name, p.multiProcessorCount,
-           p.sharedMemPerMultiprocessor / 1024.0, p.clockRate / 1e6);
+           p.sharedMemPerMultiprocessor / 1024.0, clock_khz / 1e6);
 
     const int shift=(argc>1)?atoi(argv[1]):27;
     const bool use_rand=(argc>2) && (strcmp(argv[2],"rand")==0);
@@ -524,7 +530,7 @@ int main(int argc,char** argv){
     CUDA_CHECK(cudaMemcpy(d_in,h_in,bytes,cudaMemcpyHostToDevice));
 
     const double gb=(double)bytes/1e9;
-    const double peak_bw=3350.0;               // H100 SXM HBM3 理论峰值 GB/s，换卡请改
+    const double peak_bw=384.0;               // RTX 5060 Laptop 理论峰值 384 GB/s; H100 SXM HBM3 理论峰值 3350GB/s，换卡请改
 
     // 第二趟合并：把 grid 个 partial 加成 1 个（1 个 block 足够，固定顺序 → 可复现）
     auto pass2=[&](size_t g){
@@ -586,14 +592,14 @@ int main(int argc,char** argv){
         rows[1]=run_one("(B) interleave+divergent",gridP,[&](size_t g){ reduce_interleave_div<<<g,BLOCK>>>(d_in,d_partial,n);});
         rows[2]=run_one("(C) interleave+bankconf",gridP,[&](size_t g){ reduce_interleave_conf<<<g,BLOCK>>>(d_in,d_partial,n);});
         rows[3]=run_one("(D) tree sequential",gridP,[&](size_t g){ reduce_tree_seq<<<g,BLOCK>>>(d_in,d_partial,n);});
-        rows[4]=run_one("(E) tree+shfl unrolled",gridP,[&](size_t g){ reduce_tree_unroll<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[4]=run_one("(E) tree+shfl unrolled",gridP,[&](size_t g){ reduce_tree_unroll<BLOCK><<<g,BLOCK>>>(d_in,d_partial,n);});
         rows[5]=run_one("(F) warp shuffle 2stage",gridP,[&](size_t g){ reduce_warp_2stage<<<g,BLOCK>>>(d_in,d_partial,n);});
-        rows[6]=run_one("(G) GUB BlockReduce",gridP,[&](size_t g){ reduce_cub<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[6]=run_one("(G) GUB BlockReduce",gridP,[&](size_t g){ reduce_cub<<<g,BLOCK>>>(d_in,d_partial,n);});
         char t[128];
-        snprintf(t,sizeof t,"实验 A 厚规约: grid=%zu, 每线程处理 %.0f 个元素",gridP,(double)n/(gridP*BLOCK));
+        snprintf(t,sizeof t,"Exp A thick reduce: grid=%zu, %.0f elems/thread",gridP,(double)n/(gridP*BLOCK));
         print_table(t,rows,7,gb);
-        printf("解读：几乎全部贴着 HBM 带宽 → 这是 memory-bound kernel，\n"
-               "      归约算法的优劣被访存时间淹没了。\n\n");
+        printf("解读：几乎全部贴着 HBM 带宽 → 这是 memory-bound kernel，"
+               "      归约算法的优劣被访存时间淹没了。\n");
     }
 
     // =======================================================================
@@ -602,17 +608,17 @@ int main(int argc,char** argv){
     // =======================================================================
     {
         Row rows[7];
-        rows[0]=run_one("(A) serial merge",gridT,[&](size_t g){ reduce_serial_merge<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[0]=run_one("(A) serial merge",gridT,[&](size_t g){ reduce_serial_merge<<<g,BLOCK>>>(d_in,d_partial,n);}); 
         rows[1]=run_one("(B) interleave+divergent",gridT,[&](size_t g){ reduce_interleave_div<<<g,BLOCK>>>(d_in,d_partial,n);});
         rows[2]=run_one("(C) interleave+bankconf",gridT,[&](size_t g){ reduce_interleave_conf<<<g,BLOCK>>>(d_in,d_partial,n);});
         rows[3]=run_one("(D) tree sequential",gridT,[&](size_t g){ reduce_tree_seq<<<g,BLOCK>>>(d_in,d_partial,n);});
-        rows[4]=run_one("(E) tree+shfl unrolled",gridT,[&](size_t g){ reduce_tree_unroll<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[4]=run_one("(E) tree+shfl unrolled",gridT,[&](size_t g){ reduce_tree_unroll<BLOCK><<<g,BLOCK>>>(d_in,d_partial,n);});
         rows[5]=run_one("(F) warp shuffle 2stage",gridT,[&](size_t g){ reduce_warp_2stage<<<g,BLOCK>>>(d_in,d_partial,n);});
-        rows[6]=run_one("(G) GUB BlockReduce",gridT,[&](size_t g){ reduce_cub<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[6]=run_one("(G) GUB BlockReduce",gridT,[&](size_t g){ reduce_cub<<<g,BLOCK>>>(d_in,d_partial,n);});
         char t[128];
-        snprintf(t, sizeof t, "实验 B 薄归约: grid=%zu, 每线程恰好 1 个元素", gridT);
+        snprintf(t, sizeof t, "Exp B thin reduce: grid=%zu, exactly 1 elem/thread", gridT);
         print_table(t,rows,7,gb);
-        printf("解读：(A) 应当明显最慢（串行 256 步）；(D)/(E)/(F) 拉开差距；\n"
+        printf("解读：(A) 应当明显最慢（串行 256 步）；(D)/(E)/(F) 拉开差距；"
                "      (B) 的错误是 warp 分化，(C) 的错误是 bank conflict\n");
     }
 
@@ -652,8 +658,8 @@ int main(int argc,char** argv){
         const int H=4096;               // Llama-7B 的 hidden size
         const int R=8192;               // 8192 行 ≈ 一个长 prompt 的 token 数
         const size_t xn=(size_t)R*H;
-        float* h_x=(float)malloc(xn*sizeof(float));
-        float* h_w=(float)malloc(H*sizeof(float));
+        float* h_x=(float*)malloc(xn*sizeof(float));
+        float* h_w=(float*)malloc(H*sizeof(float));
         for(size_t i=0;i<xn;++i){
             h_x[i]=(float)rand()/RAND_MAX-0.5f;
         }
@@ -663,8 +669,8 @@ int main(int argc,char** argv){
 
         float *d_x,*d_w,*d_y;
         CUDA_CHECK(cudaMalloc(&d_x,xn*sizeof(float)));
-        CUDA_CHECK(cudaMAlloc(&d_w,H*sizeof(float)));
-        CUDA_CHECK(cudaMAlloc(&d_y,xn*sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_w,H*sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_y,xn*sizeof(float)));
         CUDA_CHECK(cudaMemcpy(d_x,h_x,xn*sizeof(float),cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_w,h_w,H*sizeof(float),cudaMemcpyHostToDevice));
 
