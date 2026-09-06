@@ -527,32 +527,236 @@ int main(int argc,char** argv){
     const double peak_bw=3350.0;               // H100 SXM HBM3 理论峰值 GB/s，换卡请改
 
     // 第二趟合并：把 grid 个 partial 加成 1 个（1 个 block 足够，固定顺序 → 可复现）
+    auto pass2=[&](size_t g){
+        reduce_warp_2stage<<<1,BLOCK>>>(d_partial,d_out,g);
+    };
+    float h_res=0.0f;
+    auto grab=[&](){
+        CUDA_CHECK(cudaMemcpy(&h_res,d_out,sizeof(float),cudaMemcpyDeviceToHost));
+        return (double)h_res;
+    };
+    auto relerr=[&](double v){
+        return fabs(v-ref)/fabs(ref);
+    };
+
+    struct Row{
+        const char* name;
+        float ms;
+        double val,relerr;
+    };
+
+    // 统一的「跑一个 kernel + 计时 + 验证」流程
+    auto run_one=[&](const char* name,size_t grid,auto&& kernel_launch){
+        auto once=[&]{
+            kernel_launch(grid);
+            pass2(grid);
+        };
+        Row r{
+            name,bench(once,5,20),0,0
+        };
+        once();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        r.val=grab();
+        r.relerr=relerr(r.val);
+        return r;
+    };
+
+    auto print_table=[&](const char* title,Row* rows,int k,double moved_gb){
+        printf("=== %s ===\n", title);
+        printf("%-30s %10s %14s %8s %16s %11s\n",
+               "kernel", "time(ms)", "eff.BW", "%peak", "result", "rel.err");
+        for (int i = 0; i < k; ++i) {
+            double bw = moved_gb / (rows[i].ms / 1e3);
+            printf("%-30s %10.4f %11.0f GB/s %7.1f%% %16.2f %11.3e\n",
+                   rows[i].name, rows[i].ms, bw, 100.0 * bw / peak_bw,
+                   rows[i].val, rows[i].relerr);
+        }
+        printf("\n");
+    };
+
+    // =======================================================================
+    // 实验 A：厚归约（grid-stride，每线程处理 n/(gridP*BLOCK) 个元素）
+    //     预期结论：所有版本几乎一样快，都贴着 HBM 带宽上限。
+    //     因为时间 = 读一遍 512 MB 的时间，归约那 8 步在里面占比极小。
+    //     这个「负面结果」是今天最重要的收获之一：优化要先看它占多大比例。
+    // =======================================================================
+    {
+        Row rows[7];
+        rows[0]=run_one("(A) serial merge",gridP,[&](size_t g){ reduce_serial_merge<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[1]=run_one("(B) interleave+divergent",gridP,[&](size_t g){ reduce_interleave_div<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[2]=run_one("(C) interleave+bankconf",gridP,[&](size_t g){ reduce_interleave_conf<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[3]=run_one("(D) tree sequential",gridP,[&](size_t g){ reduce_tree_seq<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[4]=run_one("(E) tree+shfl unrolled",gridP,[&](size_t g){ reduce_tree_unroll<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[5]=run_one("(F) warp shuffle 2stage",gridP,[&](size_t g){ reduce_warp_2stage<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[6]=run_one("(G) GUB BlockReduce",gridP,[&](size_t g){ reduce_cub<<g,BLOCK>>>(d_in,d_partial,n);});
+        char t[128];
+        snprintf(t,sizeof t,"实验 A 厚规约: grid=%zu, 每线程处理 %.0f 个元素",gridP,(double)n/(gridP*BLOCK));
+        print_table(t,rows,7,gb);
+        printf("解读：几乎全部贴着 HBM 带宽 → 这是 memory-bound kernel，\n"
+               "      归约算法的优劣被访存时间淹没了。\n\n");
+    }
+
+    // =======================================================================
+    // 实验 B：薄归约（每线程恰好 1 个元素，归约成为主要成本）
+    //    这里才能看出树形的真实价值。同时 (B)(C) 的两个错误也会显形。
+    // =======================================================================
+    {
+        Row rows[7];
+        rows[0]=run_one("(A) serial merge",gridT,[&](size_t g){ reduce_serial_merge<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[1]=run_one("(B) interleave+divergent",gridT,[&](size_t g){ reduce_interleave_div<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[2]=run_one("(C) interleave+bankconf",gridT,[&](size_t g){ reduce_interleave_conf<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[3]=run_one("(D) tree sequential",gridT,[&](size_t g){ reduce_tree_seq<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[4]=run_one("(E) tree+shfl unrolled",gridT,[&](size_t g){ reduce_tree_unroll<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[5]=run_one("(F) warp shuffle 2stage",gridT,[&](size_t g){ reduce_warp_2stage<<<g,BLOCK>>>(d_in,d_partial,n);});
+        rows[6]=run_one("(G) GUB BlockReduce",gridT,[&](size_t g){ reduce_cub<<g,BLOCK>>>(d_in,d_partial,n);});
+        char t[128];
+        snprintf(t, sizeof t, "实验 B 薄归约: grid=%zu, 每线程恰好 1 个元素", gridT);
+        print_table(t,rows,7,gb);
+        printf("解读：(A) 应当明显最慢（串行 256 步）；(D)/(E)/(F) 拉开差距；\n"
+               "      (B) 的错误是 warp 分化，(C) 的错误是 bank conflict\n");
+    }
+
+    // =======================================================================
+    // 实验 C：bank_probe —— 隔离出 bank conflict 本身
+    // =======================================================================
+    {
+        const int iters=4096;
+        const size_t gridB=p.multiProcessorCount;   // 每 SM 一个 block，避免占用率干扰
+        float* d_probe=nullptr;
+        CUDA_CHECK(cudaMalloc(&d_probe,gridB*BLOCK*sizeof(float)));
+
+        float t0=bench([&]{ bank_probe<0><<<gridB,BLOCK>>>(d_probe,iters);},5,20);
+        float t1=bench([&]{ bank_probe<1><<<gridB,BLOCK>>>(d_probe,iters);},5,20);
+        float t2=bench([&]{ bank_probe<2><<<gridB,BLOCK>>>(d_probe,iters);},5,20);
+        float t4=bench([&]{ bank_probe<4><<<gridB,BLOCK>>>(d_probe,iters);},5,20);
+        float t32=bench([&]{ bank_probe<32><<<gridB,BLOCK>>>(d_probe,iters);},5,20);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        printf("=== 实验 C bank_probe: 纯 shared 读，%d 次/线程 ===\n", iters);
+        printf("%-34s %10s %10s\n", "访问模式", "time(ms)", "相对 stride=1");
+        printf("%-34s %10.4f %9.2fx\n", "STRIDE=0  (同地址 → 广播)",     t0,  t0  / t1);
+        printf("%-34s %10.4f %9.2fx\n", "STRIDE=1  (连续 → 无冲突)",   t1,  1.0);
+        printf("%-34s %10.4f %9.2fx\n", "STRIDE=2  (预期 2-way)",        t2,  t2  / t1);
+        printf("%-34s %10.4f %9.2fx\n", "STRIDE=4  (预期 4-way)",        t4,  t4  / t1);
+        printf("%-34s %10.4f %9.2fx\n", "STRIDE=32 (全同 bank → 32-way)", t32, t32 / t1);
+        printf("解读：STRIDE=0 应当和 =1 一样快（广播不是冲突）；\n"
+               "      STRIDE=2/4/32 的耗时比应当接近 2/4/32 —— 这就是「串行化」的字面含义。\n"
+               "      用 ncu 的 bank_conflicts 计数器对一下，两者应当高度吻合。\n\n");
+        CUDA_CHECK(cudaFree(d_probe));
+    }
+
+    // =======================================================================
+    // 实验 D：RMSNorm 行归约
+    // =======================================================================
+    {
+        const int H=4096;               // Llama-7B 的 hidden size
+        const int R=8192;               // 8192 行 ≈ 一个长 prompt 的 token 数
+        const size_t xn=(size_t)R*H;
+        float* h_x=(float)malloc(xn*sizeof(float));
+        float* h_w=(float)malloc(H*sizeof(float));
+        for(size_t i=0;i<xn;++i){
+            h_x[i]=(float)rand()/RAND_MAX-0.5f;
+        }
+        for(int i=0;i<H;++i){
+            h_w[i]=1.0f+0.01f*i/H;
+        }
+
+        float *d_x,*d_w,*d_y;
+        CUDA_CHECK(cudaMalloc(&d_x,xn*sizeof(float)));
+        CUDA_CHECK(cudaMAlloc(&d_w,H*sizeof(float)));
+        CUDA_CHECK(cudaMAlloc(&d_y,xn*sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_x,h_x,xn*sizeof(float),cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_w,h_w,H*sizeof(float),cudaMemcpyHostToDevice));
+
+        const float eps=1e-6f;
+        // CPU 参考：只算第 0 行，用 double
+        double ss=0.0;
+        for(int i=0;i<H;++i){
+            ss+=(double)h_x[i]*h_x[i];
+        }
+        double sc=1.0/sqrt(ss/H+eps);
+
+        float* h_y=(float*)malloc(xn*sizeof(float));
+        auto check_row0=[&](){
+            CUDA_CHECK(cudaMemcpy(h_y,d_y,(size_t)H*sizeof(float),cudaMemcpyDeviceToHost));
+            double maxrel=0.0;
+            for(int i=0;i<H;++i){
+                double want=(double)h_x[i]*sc*h_w[i];
+                double got=h_y[i];
+                double d=fabs(got-want)/(fabs(want)+1e-12);
+                if(d>maxrel) maxrel=d;
+            }
+            return maxrel;
+        };
+
+        // RMSNorm 的访存下界：读 x + 写 y（w 很小，忽略）→ 2 × xn × 4 B
+        const double rms_gb=2.0*xn*sizeof(float)/1e9;
+        struct RRow{
+            const char* name;
+            float ms;
+            double err;
+        };
+
+        RRow rr[3];
+        rr[0]={"rmsnorm serial merge",bench([&]{rmsnorm_serial<<<R,BLOCK>>>(d_x,d_w,d_y,H,eps);},5,20),0};
+        rmsnorm_serial<<<R,BLOCK>>>(d_x,d_w,d_y,H,eps);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        rr[0].err = check_row0();
+
+        rr[1]={"rmsnorm tree",bench([&]{rmsnorm_tree<<<R,BLOCK>>>(d_x,d_w,d_y,H,eps);},5,20),0};
+        rmsnorm_tree<<<R,BLOCK>>>(d_x,d_w,d_y,H,eps);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        rr[1].err = check_row0();
+
+        rr[2]={"rmsnorm warp shfl",bench([&]{rmsnorm_shfl<<<R,BLOCK>>>(d_x,d_w,d_y,H,eps);},5,20),0};
+        rmsnorm_shfl<<<R,BLOCK>>>(d_x,d_w,d_y,H,eps);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        rr[2].err = check_row0();
+
+        printf("=== 实验 D RMSNorm 行归约 (R=%d 行 × H=%d) ===\n", R, H);
+        printf("%-24s %10s %14s %8s %12s\n", "kernel", "time(ms)", "eff.BW", "%peak", "max rel.err");
+        for (auto& r : rr) {
+            double bw = rms_gb / (r.ms / 1e3);
+            printf("%-24s %10.4f %11.0f GB/s %7.1f%% %12.3e\n",
+                   r.name, r.ms, bw, 100.0 * bw / peak_bw, r.err);
+        }
+        printf("解读：这里归约占比高，串行版会明显吃亏；shuffle 版应当最接近访存下界。\n"
+               "      注意 eff.BW 用的是「读 x + 写 y」的理论下界，超过 100%% 说明 cache 帮了忙。\n\n");
+
+        CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_w)); CUDA_CHECK(cudaFree(d_y));
+        free(h_x); free(h_w); free(h_y);
+    }
+
+    CUDA_CHECK(cudaFree(d_in)); CUDA_CHECK(cudaFree(d_partial)); CUDA_CHECK(cudaFree(d_out));
+    free(h_in);
+    printf("done.\n");
+    return 0;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+// ============================================================================
+// 附录一：三个错误的归约样例
+//
+//   样例 1：沿用 Volta 之前的 volatile warp 展开
+//   if (tid < 32) {
+//       volatile float* vs = s;
+//       vs[tid] += vs[tid + 32];   // 假设「warp 内 32 线程锁步」
+//       vs[tid] += vs[tid + 16];   // Volta 起独立线程调度已打破这个假设
+//       ...                         // → 偶发错误，且只在特定 occupancy 下出现
+//   }
+//    正确：本文件 (E) 的写法，用 __shfl_down_sync 显式指定参与线程。
+//
+//   样例 2：把 barrier 放进折半分支里
+//   for (off = BS/2; off > 0; off >>= 1) {
+//       if (tid < off) { s[tid] += s[tid + off]; __syncthreads(); }  // divergent barrier
+//   }
+//    正确：barrier 必须在 if 外面。synccheck 能抓。
+//
+//   样例 3：只在循环外加一次 barrier
+//   s[tid] = sum; __syncthreads();
+//   for (off = BS/2; off > 0; off >>= 1) if (tid < off) s[tid] += s[tid + off];
+//   → 结果偶尔偏小：第 k 轮读的是第 k-1 轮写的，不同步就读到旧值。
+//    正确：每一轮都要同步；只有「同一个 warp 内部」才能靠 shuffle 免同步。
+//
 
 
 
