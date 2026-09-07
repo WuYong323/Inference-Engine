@@ -638,7 +638,7 @@ int main(int argc,char** argv){
         float t32=bench([&]{ bank_probe<32><<<gridB,BLOCK>>>(d_probe,iters);},5,20);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        printf("=== 实验 C bank_probe: 纯 shared 读，%d 次/线程 ===\n", iters);
+        printf("=== 实验 C bank_probe: 纯 shared 读，%d 次/线程 ===\n", iters);x
         printf("%-34s %10s %10s\n", "访问模式", "time(ms)", "相对 stride=1");
         printf("%-34s %10.4f %9.2fx\n", "STRIDE=0  (同地址 → 广播)",     t0,  t0  / t1);
         printf("%-34s %10.4f %9.2fx\n", "STRIDE=1  (连续 → 无冲突)",   t1,  1.0);
