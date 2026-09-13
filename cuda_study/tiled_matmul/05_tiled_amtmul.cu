@@ -271,6 +271,10 @@ __global__ void mm_reg1d(const float* __restrict__ A,const float* __restrict__ B
 
         A+=BK;            // 指针沿 K 维滑动（比每次重算 index 省寄存器和指令）
         B+=(size_t)BK*N;
+#pragma unroll
+        for(int k=0;k<BK;++k){
+
+        }
     }
 }
 
