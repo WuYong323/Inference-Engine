@@ -1,4 +1,4 @@
-// =============================================================================
+﻿// =============================================================================
 // 05_tiled_matmul.cu  ——  分块矩阵乘（tiled matmul）+ cuBLAS 差距分析
 //
 // 上游    ：04/04_tree_reduction.cu（shared memory / bank conflict / barrier）
@@ -12,7 +12,7 @@
 //         需要 sm_80 以上（用到 TF32 WMMA）。
 //
 //   编译（-Xptxas -v 看：寄存器数 / shared 用量 / 有没有 spill）：
-//     nvcc -O3 -arch=sm_120 -lineinfo -Xptxas -v -Xcompiler="/utf-8 /Zc:preprocessor /std:c++17" -o 05_tiled_matmul 05_tiled_matmul.cu -lcublas
+//     nvcc -O3 -arch=sm_120 -lineinfo -Xptxas -v -std=c++17 -o 05_tiled_matmul 05_tiled_matmul.cu -lcublas
 //
 //   运行：
 //     ./05_tiled_matmul                     # 默认 M=N=K=4096，跑全部 5 组实验
@@ -726,9 +726,9 @@ int main(int argc, char** argv) {
     // 实验 2：TILE 大小扫描 —— 算术强度 = TILE/4，但 TILE 越大不总是越好
     // =========================================================================
     printf("\n--- 实验 2：shared memory 分块，TILE 大小扫描 ------------------\n");
-    {
-        auto launch_tiled = [&](auto tile_tag) {
-            constexpr int T = decltype(tile_tag)::value;
+        {
+        {
+            constexpr int T = 8;
             dim3 blk(T, T);
             dim3 grd((N + T - 1) / T, (M + T - 1) / T);
             char nm[64];
@@ -738,10 +738,31 @@ int main(int argc, char** argv) {
                      (size_t)(2 * T * T * sizeof(float)) / 1024, T * T);
             run_and_record(nm, T / 4.0, nt,
                            [&] { mm_tiled<T><<<grd, blk>>>(dA, dB, dC, M, N, K); });
-        };
-        launch_tiled(std::integral_constant<int, 8>{});
-        launch_tiled(std::integral_constant<int, 16>{});
-        launch_tiled(std::integral_constant<int, 32>{});
+        }
+        {
+            constexpr int T = 16;                 // ← 与上一块完全相同，只改这个数字
+            dim3 blk(T, T);
+            dim3 grd((N + T - 1) / T, (M + T - 1) / T);
+            char nm[64];
+            snprintf(nm, sizeof(nm), "C tiled TILE=%-2d", T);
+            char nt[64];
+            snprintf(nt, sizeof(nt), "shared %zu KB/block, %d 线程",
+                     (size_t)(2 * T * T * sizeof(float)) / 1024, T * T);
+            run_and_record(nm, T / 4.0, nt,
+                           [&] { mm_tiled<T><<<grd, blk>>>(dA, dB, dC, M, N, K); });
+        }
+        {
+            constexpr int T = 32;                 // ← 同上
+            dim3 blk(T, T);
+            dim3 grd((N + T - 1) / T, (M + T - 1) / T);
+            char nm[64];
+            snprintf(nm, sizeof(nm), "C tiled TILE=%-2d", T);
+            char nt[64];
+            snprintf(nt, sizeof(nt), "shared %zu KB/block, %d 线程",
+                     (size_t)(2 * T * T * sizeof(float)) / 1024, T * T);
+            run_and_record(nm, T / 4.0, nt,
+                           [&] { mm_tiled<T><<<grd, blk>>>(dA, dB, dC, M, N, K); });
+        }
     }
 
     // =========================================================================
@@ -844,7 +865,10 @@ int main(int argc, char** argv) {
     printf(" %-28s %9s %10s %8s %9s %s\n", "kernel", "ms", "TFLOP/s", "%peak",
            "模型AI", "备注");
     double best = 0.0;
-    for (auto& r : rows) best = std::max(best, r.tflops);
+    for (auto& r : rows) {
+        // 只统计手写 FP32 kernel（A~F），不要把 cuBLAS 和 TF32 算进来
+        if (r.name[0] >= 'A' && r.name[0] <= 'F') best = std::max(best, r.tflops);
+    }
     for (auto& r : rows) {
         char ai[16];
         if (r.model_ai < 0) snprintf(ai, sizeof(ai), "%9s", "-");
