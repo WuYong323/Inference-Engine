@@ -203,7 +203,7 @@ __global__ void mm_tiled(const float* __restrict__ A,const float* __restrict__ B
         sA[ty][tx]=(row<M&&aCol<K)?A[(size_t)row*K+aCol]:0.0f;
         sB[ty][tx]=(bRow<K&&col<N)?B[(size_t)bRow*N+col]:0.0f;
 
-        __syncthread();        // 栅栏 1：等全 block 搬完，才能开始用别人搬的数据
+        __syncthreads();        // 栅栏 1：等全 block 搬完，才能开始用别人搬的数据
 
         // ── 阶段②：计算。这段完全不碰 global memory ──
         // bank 分析：
@@ -215,7 +215,7 @@ __global__ void mm_tiled(const float* __restrict__ A,const float* __restrict__ B
             acc+=sA[ty][k]*sB[k][tx];
         }
 
-        __syncthread();    //   栅栏 2：等全 block 算完，才能覆盖 shared 迎接下一块
+        __syncthreads();    //   栅栏 2：等全 block 算完，才能覆盖 shared 迎接下一块
                            //   少了这个 → 跑得快的线程把 sA 覆盖掉，慢的线程读到下一块
                            //   的数据。典型症状：小规模"碰巧对"，大规模偶发错。
     }
@@ -267,22 +267,189 @@ __global__ void mm_reg1d(const float* __restrict__ A,const float* __restrict__ B
     for(int bk=0;bk<K;bk+=BK){
         sA[irA][icA]=A[(size_t)irA*K+icA];
         sB[irB][icB]=B[(size_t)irB*N+icB];
-        __syncthread();
+        __syncthreads();
 
         A+=BK;            // 指针沿 K 维滑动（比每次重算 index 省寄存器和指令）
         B+=(size_t)BK*N;
 #pragma unroll
         for(int k=0;k<BK;++k){
+            const float bv=sB[k][tCol];      //  读一次，复用 TM 次
+#pragma unroll
+            for(int i=0;i<TM;++i){
+                acc[i]+=sA[tRow*TM+i][k]*bv;
+            }
+        }
+        __syncthreads();
+    }
 
+#pragma unroll
+    for(int i=0;i<TM;++i){
+        C[(size_t)(tRow*TM+i)*N+tCol]=acc[i];
+    }
+}
+
+// =============================================================================
+// (E) 二维寄存器分块：每个线程负责 TM×TN 个输出 —— 质变发生在这一步
+// =============================================================================
+//
+// 关键的账：
+//   每个 k 步，读 TM 个 A 值 + TN 个 B 值 = (TM+TN) 个 float，
+//   却能做 TM*TN 次 FMA。TM=TN=8 → 16 个 float（64 B）换 64 次 FMA
+//   = 1.0 FMA/Byte —— 正好等于 H100 "128 FMA/cycle : 128 B/cycle" 的比例。
+//   这就是为什么工业库的 thread tile 几乎都是 8×8 或 8×4，不是随便选的。
+//
+// 同时 block tile 128×128 → global 算术强度 = 128*128/(2*256) = 32 FLOP/Byte
+//   > H100 FP32 ridge point (~20) → 第一次真正跨进 compute-bound 区域。
+//
+// 实现细节：A 的 tile 转置存进 shared（sA[BK][BM]），这样内层循环读 A 的一"列"
+// 变成读连续地址，才能用 float4 一次取 4 个（见 (F)）。
+template <int BM,int BN,int BK,int TM,int TN>
+__global__ void mm_reg2d(const float* __restrict__ A,const float* __restrict__ B,float* __restrict__ C,int M,int N,int K){
+    constexpr int THREADS=(BM*BN)/(TM*TN);
+    static_assert(BM*BK%THREADS==0,"A tile must be loadable in whole passes");
+    static_assert(BK*BN%THREADS==0,"B tile must be loadable in whole passes");
+
+    __shared__ float sA[BK][BM];      // ← 转置存：sA[k][m]
+    __shared__ float sB[BK][BN];      // ← 正常存：sB[k][n]
+
+    A+=(size_t)blockIdx.y*BM*K;       //第 blockIdx.y 块 BM*BN tile 块 的第一行
+    B+=(size_t)blockIdx.x*BN;         //第 blockIdx.x 块 BM*BN tile 块 的第一行
+    C+=(size_t)blockIdx.y*BM*N+(size_t)blockIdx.x*BN;      // C的第 blockIdx.y 行, 第 blockIdx.x 列
+
+    // 计算分工：thread tile 网格是 (BM/TM) × (BN/TN)
+    const int tRow=threadIdx.x/(BN/TN);
+    const int tCol=threadIdx.x%(BN/TN);
+
+    // 搬运分工
+    const int irA=threadIdx.x/BK,icA=threadIdx.x%BK;
+    cosnt int irB=threadIdx.x/BN,icB=threadIdx.x%BN;
+    constexpr int strideA=THREADS/BK;   // 一趟能覆盖多少行 A
+    constexpr int strideB=THREADS/BN;   // 一趟能覆盖多少行 B
+
+    float acc[TM][TN]={};
+    float regM[TM],regN[TN];
+
+    for(int bk=0;bk<k;bk+=BK){
+#pragma unroll
+        for(int off=0;off<BM;off+=strideA){
+            // 转置写入：读 A 是行连续（合并），写 shared 是跨行（这里会有 bank
+            // 冲突，(F) 用 padding 改善）
+            sA[icA][irA+off]=A[(size_t)(irA+off)*K+icA];
+        }
+#pragma unroll
+        for(int off=0;off<BK;off+=strideB){
+            sB[irB+off][icB]=B[(size_t)(irB+off)*N+icB];
+        }
+        __syncthreads();
+        A+=BK;
+        B+=(size_t)BK*N;
+
+#pragma unroll
+        for(int k=0;k<BK;++k){
+            // 先把这一列 A / 这一行 B 拉进寄存器（每个只读一次）
+#pragma unroll
+            for(int i=0;i<TM;++i) regM[i]=sA[k][tRow*TM+i];
+#pragma unroll
+            for(int j=0;j<TN;++j) regN[j]=sB[k][tCol*TN+j];
+            // 然后在寄存器里做 TM*TN 次 FMA —— 一次 shared 读，多次复用
+            // 这 64 条 FADD/FFMA 互相独立 → 指令级并行(ILP)拉满，掩盖 FMA 延迟
+#pragma unroll
+            for(int i=0;i<TM;++i){
+#pragma unroll
+                for(int j=0;j<TN;++j){
+                    acc[i][j]+=regM[i]*regN[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for(int i=0;i<TM;++i){
+#pragma unroll
+        for(int j=0;j<TN;++j){
+            C[(size_t)(tRow*TM+i)*N+tCol*TN+j]=acc[i][j];
         }
     }
 }
 
+// =============================================================================
+// (F) + float4 向量化访存 + shared memory padding（PAD 模板参数用来做 A/B 对照）
+// =============================================================================
+//
+// 两个新技巧：
+//  1) float4：一条 LDG.128 / STS.128 / LDS.128 顶四条标量指令。
+//     省的是"指令发射带宽"和"访存请求数"——不是 DRAM 字节数。
+//  2) PAD：sA 声明成 [BK][BM+PAD]。手算（路数取决于一个 warp 内
+//     irA 有几个不同取值，改搬运分工路数就变，只能算）：
+//       标量版 (E)：irA = tid/8 → 一个 warp 只有 4 个 irA
+//               PAD=0 → bank = (icA*128 + irA) % 32 = irA % 32
+//                       → 只用到 4 个 bank，每 bank 8 个 lane → 8-way 冲突
+//       float4 版 (F)：每线程搬 4 个，一个 warp 覆盖更多行，路数更低
+//       PAD=4 → bank = (icA*(BM+4) + irA) % 32 = (icA*4 + irA) % 32
+//               → 4*icA 取 {0,4,...,28}，irA 取 {0..3} 填满间隔 → 冲突归零
+//     注意 sB 侧没修：bank = (tCol*8 + j) % 32，tCol*8 只有 4 个取值 → 仍 8-way，
+//     且病因是 tCol 乘了 8，padding 解决不了，要 swizzle（交错寻址）。
+//     PAD=4 而不是 PAD=1 的原因：要保持 16 Byte 对齐，float4 读取才不会崩。
+//     （4 floats = 16 B，(128+4)*4 = 528 B，528 % 16 == 0）
+template <int BM,int BN,int BK,int TM,int TN,int PAD>
+__global__ void mm_reg2d_vec(const float* __restrict__ A,const float* __restrict__ B,float* __restrict__ C,int M,int N,int K){
+    constexpr int THREADS=(BM*BN)/(TM*TN);
+    static_assert(TM==8&&TN==8,"手写展开假设 8x8 thread tile");
+    static_assert(BM*BK/4==THREADS,"A tile: 每线程恰好一个 float4");
+    static_assert(BK*BN/4==THREADS,"B tile: 每线程恰好一个 float4");
+    static_assert(PAD%4==0,"PAD 必须是 4 的倍数，否则 float4 读取不对齐");
+
+    __shared__ float sA[BK][BM+PAD];
+    __shared__ float sB[BK][BN];
+
+    A+=(size_t)blockIdx.y*BM*K;
+    B+=(size_t)blockIdx.x*BN;
+    C+=(size_t)blockIdx.y*BM*N+(size_t)blockIdx.x*BN;
+
+    const int tRow=threadIdx.x/(BN/TN);
+    const int tCol=threadIdx.x%(BN/TN);
+
+    // float4 搬运分工：每线程一个 float4
+    const int irA=threadIdx.x/(BK/4);            // A 的行
+    const int icA=(threadIdx.x%(BK/4))*4;        // A 的列（4 的倍数）
+    const int irB=(threadIdx.x/(BN/4));          // B 的行
+    const int icB=(threadIdx.x%(BN/4))*4;        // B 的列
+
+    float acc[TM][TN]={};
+    float regM[TM],regN[TN];
+
+    for(int bk=0;bk<K;bk+=BK){
+        // A：一次读 4 个连续的 K 元素，然后拆成 4 个标量转置写进 shared
+        {
+            const float4 t=*reinterpret_cast<const float4*>(&A[(size_t)irA*K+icA]);
+            sA[icA+0][irA]=t.x;
+            sA[icA+1][irA]=t.y;
+            sA[icA+2][irA]=t.z;
+            sA[icA+3][irA]=t.w;
+        }
+        // B：读连续 4 个 N 元素，直接 float4 写进 shared（行方向，无需转置）
+        {
+            const float4 t=*reinterpret_cast<const float4*>(&B[(size_t)irB*N+icB]);
+            *reinterpret_cast<float4*>(&sB[irB][icB])=t;
+        }
+        __syncthreads();
+
+        A+=BK;
+        B+=(size_t)BK*N;
+
+#pragma unroll
+        for(int k=0;k<BK;++k){
+            // 用 float4 从 shared 取：2 条 LDS.128 代替 8 条 LDS.32
+            // 注意：不要对 regM 取地址后 reinterpret_cast —— 那会把局部数组
+            // 逼进 local memory（=显存）。逐成员拷贝才能保证留在寄存器里。
+            {
+                const float4 a0=*reinterpret_cast<const float4*> (&sA[k][])
+            }
+        }
+    }
 
 
-
-
-
+}
 
 
 
