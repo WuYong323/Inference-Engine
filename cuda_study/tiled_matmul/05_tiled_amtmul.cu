@@ -12,17 +12,17 @@
 //         需要 sm_80 以上（用到 TF32 WMMA）。
 //
 //   编译（-Xptxas -v 看：寄存器数 / shared 用量 / 有没有 spill）：
-//     nvcc -O3 -arch=sm_120 -lineinfo -Xptxas -v -Xcompiler="/utf-8 /Zc:preprocessor /std:c++17" -o 05_tiled_matmul.cu 05_tiled_matmul.cu -lcublas
+//     nvcc -O3 -arch=sm_120 -lineinfo -Xptxas -v -Xcompiler="/utf-8 /Zc:preprocessor /std:c++17" -o 05_tiled_matmul 05_tiled_matmul.cu -lcublas
 //
 //   运行：
-//     ./05_tiled_matmul.cu                     # 默认 M=N=K=4096，跑全部 5 组实验
-//     ./05_tiled_matmul.cu 2048 2048 2048      # 自定义规模
-//     ./05_tiled_matmul.cu 4096 4096 4096 20   # 第 4 个参数 = 计时迭代次数
+//     ./05_tiled_matmul                     # 默认 M=N=K=4096，跑全部 5 组实验
+//     ./05_tiled_matmul 2048 2048 2048      # 自定义规模
+//     ./05_tiled_matmul 4096 4096 4096 20   # 第 4 个参数 = 计时迭代次数
 //
 //   正确性检验：
-//     compute-sanitizer --tool memcheck   ./05_tiled_matmul.cu 512 512 512
-//     compute-sanitizer --tool racecheck  ./05_tiled_matmul.cu 512 512 512
-//     compute-sanitizer --tool synccheck  ./05_tiled_matmul.cu 512 512 512
+//     compute-sanitizer --tool memcheck   ./05_tiled_matmul 512 512 512
+//     compute-sanitizer --tool racecheck  ./05_tiled_matmul 512 512 512
+//     compute-sanitizer --tool synccheck  ./05_tiled_matmul 512 512 512
 //
 //   profiling：
 //     # ① 在 Roofline 上的位置：计算吞吐 vs 访存吞吐
