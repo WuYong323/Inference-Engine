@@ -251,7 +251,7 @@ __global__ void mm_reg1d(const float* __restrict__ A,const float* __restrict__ B
     // 本 block 负责 C 的哪一块
     A+=(size_t)blockIdx.y*BM*K;
     B+=(size_t)blockIdx.x*BN;
-    C+=(size_t)blockIdx.y*BM*N+(size_t)blockIdx.x*BM;
+    C+=(size_t)blockIdx.y*BM*N+(size_t)blockIdx.x*BN;
 
     // 计算时的分工：本线程负责 C 块内的 TM 行 × 1 列
     const int tCol=threadIdx.x%BN;          // 0..BN-1（连续 → 访存友好）
@@ -260,7 +260,7 @@ __global__ void mm_reg1d(const float* __restrict__ A,const float* __restrict__ B
     // 搬运时的分工（和计算时的分工可以不一样。 这是分块 kernel 的常见做法：
     // 搬运追求"合并访问"，计算追求"寄存器复用"，两者最优的索引映射不同）
     const int irA=threadIdx.x/BK,icA=threadIdx.x%BK;
-    const int irB=threadIdx.x/BN,icA=threadIdx.x%BN;
+    const int irB=threadIdx.x/BN,icB=threadIdx.x%BN;
 
     float acc[TM]={};
 
@@ -322,14 +322,14 @@ __global__ void mm_reg2d(const float* __restrict__ A,const float* __restrict__ B
 
     // 搬运分工
     const int irA=threadIdx.x/BK,icA=threadIdx.x%BK;
-    cosnt int irB=threadIdx.x/BN,icB=threadIdx.x%BN;
+    const int irB=threadIdx.x/BN,icB=threadIdx.x%BN;
     constexpr int strideA=THREADS/BK;   // 一趟能覆盖多少行 A
     constexpr int strideB=THREADS/BN;   // 一趟能覆盖多少行 B
 
     float acc[TM][TN]={};
     float regM[TM],regN[TN];
 
-    for(int bk=0;bk<k;bk+=BK){
+    for(int bk=0;bk<K;bk+=BK){
 #pragma unroll
         for(int off=0;off<BM;off+=strideA){
             // 转置写入：读 A 是行连续（合并），写 shared 是跨行（这里会有 bank
@@ -443,12 +443,70 @@ __global__ void mm_reg2d_vec(const float* __restrict__ A,const float* __restrict
             // 注意：不要对 regM 取地址后 reinterpret_cast —— 那会把局部数组
             // 逼进 local memory（=显存）。逐成员拷贝才能保证留在寄存器里。
             {
-                const float4 a0=*reinterpret_cast<const float4*> (&sA[k][])
+                const float4 a0=*reinterpret_cast<const float4*> (&sA[k][tRow*TM]);
+                const float4 a1=*reinterpret_cast<const float4*> (&sA[k][tRow*TM+4]);
+                regM[0]=a0.x;regM[1]=a0.y;regM[2]=a0.z;regM[3]=a0.w;
+                regM[4]=a1.x;regM[5]=a1.y;regM[6]=a1.z;regM[7]=a1.w;
+            }
+            {
+                const float4 b0=*reinterpret_cast<const float4*>(&sB[k][tCol*TN]);
+                const float4 b1=*reinterpret_cast<const float4*>(&sB[k][tCol*TN+4]);
+                regN[0]=b0.x;regN[1]=b0.y;regN[2]=b0.z;regN[3]=b0.w;
+                regN[4]=b1.x;regN[5]=b1.y;regN[6]=b1.z;regN[7]=b1.w;
+            }
+#pragma unroll
+            for(int i=0;i<TM;++i){
+#pragma unroll
+                for(int j=0;j<TN;++j) acc[i][j]+=regM[i]*regN[j];
             }
         }
+        __syncthreads();
     }
 
+    // 写回也用 float4：连续 4 列一次写出
+#pragma unroll
+    for(int i=0;i<TM;++i){
+        float* dst=&C[(size_t)(tRow*TM+i)*N+tCol*TN];
+        *reinterpret_cast<float4*>(dst)=make_float4(acc[i][0],acc[i][1],acc[i][2],acc[i][3]);
+        *reinterpret_cast<float4*>(dst+4)=make_float4(acc[i][4],acc[i][5],acc[i][6],acc[i][7]);
+    }
+}
 
+// =============================================================================
+// (I) 手写 Tensor Core（WMMA + TF32）—— 故意不做 tiling，用来证明一件事
+// =============================================================================
+//
+// Tensor Core 不是使用就会快的。这个 kernel 每算一个 16×16 输出块都直接
+// 从 global memory 读 A/B，算术强度和朴素版一个数量级 → 算力再强也被访存卡死。
+// 预期：它可能还不如 (E)/(F)。这正是笔记 §6.3 的论点：
+//   "Tensor Core 提供的是更高的计算屋顶，tiling 提供的是爬上去的梯子。"
+//
+// 精度提醒：TF32 = 8 位指数 + 10 位尾数（FP32 是 23 位尾数）。
+// 所以这个 kernel 和 FP32 版本的结果差异会明显大得多（相对误差 ~1e-3 量级），
+// 这不是 bug，是 TF32 的定义。工业上判断"能不能用 TF32"要看下游任务容不容忍。
+namespace wmma=nvcuda::wmma;
+
+__global__ void mm_wmma_tf32_naive(const float* __restrict__ A,const float* __restrict__ B,float* __restrict__ C,int M,int N,int K){
+    // 一个 warp 负责一个 16×16 的 C 块；一个 block 4 个 warp 沿 N 排开
+    const int warpN=blockIdx.x*4+threadIdx.y;
+    const int warpM=blockIdx.y;
+    if(warpM*16>=M||warpN*16>=N) return;
+
+    wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::row_major> fa;
+    wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::row_major> fb;
+    wmma::fill_fragment(fc, 0.0f);
+
+    for (int k = 0; k < K; k += 8) {
+        wmma::load_matrix_sync(fa, A + (size_t)warpM * 16 * K + k, K);
+        wmma::load_matrix_sync(fb, B + (size_t)k * N + warpN * 16, N);
+        // TF32 fragment 必须显式做一次舍入（CUDA 的要求，不是可选优化）
+#pragma unroll
+        for (int i = 0; i < fa.num_elements; ++i) fa.x[i] = wmma::__float_to_tf32(fa.x[i]);
+#pragma unroll
+        for (int i = 0; i < fb.num_elements; ++i) fb.x[i] = wmma::__float_to_tf32(fb.x[i]);
+        wmma::mma_sync(fc, fa, fb, fc);
+    }
+    wmma::store_matrix_sync(C + (size_t)warpM * 16 * N + warpN * 16, fc, N,wmma::mem_row_major);
 }
 
 
@@ -456,9 +514,359 @@ __global__ void mm_reg2d_vec(const float* __restrict__ A,const float* __restrict
 
 
 
+// =============================================================================
+// 1. 主机侧：结果表 + 正确性验证 + Roofline 模型
+// =============================================================================
 
+struct DeviceInfo {
+    std::string name;
+    int sms = 0;
+    double fp32_peak = 0.0;   // FLOP/s，CUDA core（非 tensor）
+    double bw_peak = 0.0;     // Byte/s
+    size_t smem_per_sm = 0;
+};
 
+static DeviceInfo query_device() {
+    cudaDeviceProp p{};
+    CUDA_CHECK(cudaGetDeviceProperties(&p, 0));
+    DeviceInfo d;
+    d.name = p.name;
+    d.sms = p.multiProcessorCount;
+    d.smem_per_sm = p.sharedMemPerMultiprocessor;
+    // 假设：每个 SM 128 个 FP32 core，每 core 每周期 1 次 FMA = 2 FLOP
+    // （Ampere/Hopper/Ada 的消费级与数据中心卡都成立；老架构需要改这个常数）
+    d.fp32_peak = 2.0 * 128.0 * d.sms * (p.clockRate * 1e3);
+    // HBM/GDDR 都是 DDR，所以乘 2
+    d.bw_peak = 2.0 * (p.memoryClockRate * 1e3) * (p.memoryBusWidth / 8.0);
+    if (d.bw_peak <= 0) d.bw_peak = 3.35e12;   // 驱动读不到时退回 H100 SXM 的标称值
+    return d;
+}
 
+struct Row {
+    std::string name;
+    double ms = 0.0;
+    double tflops = 0.0;
+    double model_ai = -1.0;     // 模型算术强度（FLOP/Byte），-1 表示不适用
+    double max_rel_err = -1.0;
+    std::string note;
+};
+
+// 用 double 在 CPU 上抽样重算若干个 C 元素 —— 全量重算 4096³ 太慢（1.4e11 次
+// 乘加），抽样是工业上标准做法：既能抓住"整体算错"，也能抓住"某个 tile 边界错"。
+// 关键是抽样要覆盖边角（第一行/最后一行/最后一列）而不是纯随机。
+static double sampled_max_rel_err(const std::vector<float>& hA,
+                                  const std::vector<float>& hB,
+                                  const std::vector<float>& hC,
+                                  int M, int N, int K, int nSamples) {
+    std::mt19937 rng(1234);
+    std::uniform_int_distribution<int> di(0, M - 1), dj(0, N - 1);
+
+    std::vector<std::pair<int,int>> pts;
+    pts.push_back({0, 0});
+    pts.push_back({0, N - 1});
+    pts.push_back({M - 1, 0});
+    pts.push_back({M - 1, N - 1});
+    for (int s = (int)pts.size(); s < nSamples; ++s) pts.push_back({di(rng), dj(rng)});
+
+    double worst = 0.0;
+    for (auto& pr : pts) {
+        const int i = pr.first, j = pr.second;
+        double ref = 0.0;
+        for (int k = 0; k < K; ++k) ref += (double)hA[(size_t)i * K + k] *
+                                          (double)hB[(size_t)k * N + j];
+        const double got = (double)hC[(size_t)i * N + j];
+        const double den = std::max(1e-8, std::fabs(ref));
+        worst = std::max(worst, std::fabs(got - ref) / den);
+    }
+    return worst;
+}
+
+// 和参考结果（cuBLAS）逐元素比：返回 max|diff| / max|ref|
+static double max_rel_err_vs(const std::vector<float>& got,
+                             const std::vector<float>& ref) {
+    double maxAbs = 0.0, maxRef = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        maxAbs = std::max(maxAbs, (double)std::fabs(got[i] - ref[i]));
+        maxRef = std::max(maxRef, (double)std::fabs(ref[i]));
+    }
+    return maxAbs / std::max(1e-8, maxRef);
+}
+
+// -----------------------------------------------------------------------------
+// cuBLAS 的行主序陷阱
+// -----------------------------------------------------------------------------
+// cuBLAS 是列主序（Fortran 传统）。而 C/C++ 里我们用行主序。
+// 关键洞察：**一块行主序的 M×N 数据，被列主序的眼睛看过去，就是 N×M 的转置。**
+// 所以：把 (B, A) 按列主序传进去算 B^T · A^T = (A·B)^T = C^T，
+//       而 C^T 用行主序的眼睛看回来，正好就是我们想要的 C。
+// 于是参数是：m=N, n=M, k=K, A_ptr=B(lda=N), B_ptr=A(ldb=K), C_ptr=C(ldc=N)。
+static void cublas_rowmajor_sgemm(cublasHandle_t h, const float* dA, const float* dB,
+                                  float* dC, int M, int N, int K) {
+    const float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                             N, M, K,
+                             &alpha,
+                             dB, N,       // 列主序看到的是 B^T (N×K)
+                             dA, K,       // 列主序看到的是 A^T (K×M)
+                             &beta,
+                             dC, N));
+}
+
+// =============================================================================
+// 2. 实验
+// =============================================================================
+
+int main(int argc, char** argv) {
+    const int M = (argc > 1) ? atoi(argv[1]) : 4096;
+    const int N = (argc > 2) ? atoi(argv[2]) : 4096;
+    const int K = (argc > 3) ? atoi(argv[3]) : 4096;
+    const int ITERS = (argc > 4) ? atoi(argv[4]) : 10;
+    const int WARMUP = 3;
+
+    const DeviceInfo dev = query_device();
+    const double totalFlop = 2.0 * M * N * K;
+    // 理论最小访存量：A、B、C 各只读/写一次
+    const double minBytes = 4.0 * ((double)M * K + (double)K * N + (double)M * N);
+
+    printf("=============================================================\n");
+    printf(" 05_tiled_matmul  ——  W1 Day5-6 分块矩阵乘 + cuBLAS 差距分析\n");
+    printf("=============================================================\n");
+    printf("GPU              : %s (%d SM, shared/SM = %.0f KB)\n",
+           dev.name.c_str(), dev.sms, dev.smem_per_sm / 1024.0);
+    printf("FP32 峰值(CUDA core): %.1f TFLOP/s   HBM 峰值: %.0f GB/s\n",
+           dev.fp32_peak / 1e12, dev.bw_peak / 1e9);
+    printf("ridge point (FP32)  : %.1f FLOP/Byte  ← 低于这个值 = memory-bound\n",
+           dev.fp32_peak / dev.bw_peak);
+    printf("问题规模         : M=%d N=%d K=%d   总计算量 %.1f GFLOP\n", M, N, K,
+           totalFlop / 1e9);
+    printf("理论最小访存     : %.1f MB  →  问题本身的算术强度 = %.0f FLOP/Byte\n",
+           minBytes / 1e6, totalFlop / minBytes);
+    printf("               （问题本身极度 compute-bound；朴素实现却是 memory-bound，\n");
+    printf("                 这个反差就是今天全部内容的起点）\n\n");
+
+    // ── 数据准备（固定 seed：可复现是你自己定的产出规范）──────────────
+    std::mt19937 rng(20260727);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> hA((size_t)M * K), hB((size_t)K * N);
+    for (auto& v : hA) v = dist(rng);
+    for (auto& v : hB) v = dist(rng);
+
+    float *dA = nullptr, *dB = nullptr, *dC = nullptr, *dRef = nullptr;
+    CUDA_CHECK(cudaMalloc(&dA, sizeof(float) * hA.size()));
+    CUDA_CHECK(cudaMalloc(&dB, sizeof(float) * hB.size()));
+    CUDA_CHECK(cudaMalloc(&dC, sizeof(float) * (size_t)M * N));
+    CUDA_CHECK(cudaMalloc(&dRef, sizeof(float) * (size_t)M * N));
+    CUDA_CHECK(cudaMemcpy(dA, hA.data(), sizeof(float) * hA.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, hB.data(), sizeof(float) * hB.size(), cudaMemcpyHostToDevice));
+
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+
+    std::vector<float> hRef((size_t)M * N), hC((size_t)M * N);
+
+    // ── 先拿 cuBLAS 当参考，并用 double 抽样验证 cuBLAS 本身 ───────────
+    cublas_rowmajor_sgemm(handle, dA, dB, dRef, M, N, K);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(hRef.data(), dRef, sizeof(float) * hRef.size(),
+                          cudaMemcpyDeviceToHost));
+    const double refErr = sampled_max_rel_err(hA, hB, hRef, M, N, K, 64);
+    printf("[参考校验] cuBLAS SGEMM vs CPU double（抽样 64 点）：max rel err = %.3e\n",
+           refErr);
+    printf("           K=%d 的 fp32 累加，1e-6~1e-5 量级是正常的（误差 ~ sqrt(K)*eps）\n\n",
+           K);
+
+    std::vector<Row> rows;
+
+    auto run_and_record = [&](const std::string& name, double model_ai,
+                              const std::string& note, auto launch) {
+        CUDA_CHECK(cudaMemset(dC, 0, sizeof(float) * (size_t)M * N));
+        launch();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            printf("  [skip] %-28s launch 失败: %s\n", name.c_str(),
+                   cudaGetErrorString(e));
+            return;
+        }
+        CUDA_CHECK(cudaMemcpy(hC.data(), dC, sizeof(float) * hC.size(),
+                              cudaMemcpyDeviceToHost));
+        Row r;
+        r.name = name;
+        r.model_ai = model_ai;
+        r.note = note;
+        r.max_rel_err = max_rel_err_vs(hC, hRef);
+        r.ms = time_ms(launch, WARMUP, ITERS);
+        r.tflops = totalFlop / (r.ms * 1e-3) / 1e12;
+        rows.push_back(r);
+        printf("  %-28s %9.3f ms  %8.2f TFLOP/s  %5.1f%% peak   relerr %.2e\n",
+               r.name.c_str(), r.ms, r.tflops,
+               100.0 * (r.tflops * 1e12) / dev.fp32_peak, r.max_rel_err);
+    };
+
+    // =========================================================================
+    // 实验 1：一行之差 —— 合并访问对朴素 matmul 的影响
+    // =========================================================================
+    printf("--- 实验 1：朴素 matmul，row/col 谁绑 threadIdx.x ---------------\n");
+    {
+        dim3 blk(32, 32);
+        dim3 grdBad((M + 31) / 32, (N + 31) / 32);
+        dim3 grdGood((N + 31) / 32, (M + 31) / 32);
+        run_and_record("A naive (uncoalesced)", 0.25, "row 绑 tx，访存散",
+                       [&] { mm_naive_uncoalesced<<<grdBad, blk>>>(dA, dB, dC, M, N, K); });
+        run_and_record("B naive (coalesced)", 0.25, "col 绑 tx，访存合并",
+                       [&] { mm_naive_coalesced<<<grdGood, blk>>>(dA, dB, dC, M, N, K); });
+    }
+
+    // =========================================================================
+    // 实验 2：TILE 大小扫描 —— 算术强度 = TILE/4，但 TILE 越大不总是越好
+    // =========================================================================
+    printf("\n--- 实验 2：shared memory 分块，TILE 大小扫描 ------------------\n");
+    {
+        auto launch_tiled = [&](auto tile_tag) {
+            constexpr int T = decltype(tile_tag)::value;
+            dim3 blk(T, T);
+            dim3 grd((N + T - 1) / T, (M + T - 1) / T);
+            char nm[64];
+            snprintf(nm, sizeof(nm), "C tiled TILE=%-2d", T);
+            char nt[64];
+            snprintf(nt, sizeof(nt), "shared %zu KB/block, %d 线程",
+                     (size_t)(2 * T * T * sizeof(float)) / 1024, T * T);
+            run_and_record(nm, T / 4.0, nt,
+                           [&] { mm_tiled<T><<<grd, blk>>>(dA, dB, dC, M, N, K); });
+        };
+        launch_tiled(std::integral_constant<int, 8>{});
+        launch_tiled(std::integral_constant<int, 16>{});
+        launch_tiled(std::integral_constant<int, 32>{});
+    }
+
+    // =========================================================================
+    // 实验 3：寄存器分块阶梯 —— 从 shared 带宽受限爬到接近算力上限
+    // =========================================================================
+    printf("\n--- 实验 3：寄存器分块阶梯（本文件的核心）---------------------\n");
+    {
+        const bool ok1d = (M % 64 == 0 && N % 64 == 0 && K % 8 == 0);
+        const bool ok2d = (M % 128 == 0 && N % 128 == 0 && K % 8 == 0);
+        if (ok1d) {
+            constexpr int BM = 64, BN = 64, BK = 8, TM = 8;
+            dim3 blk((BM * BN) / TM);
+            dim3 grd(N / BN, M / BM);
+            run_and_record("D reg1d 64x64, TM=8", (double)BM * BN / (2.0 * (BM + BN)),
+                           "每线程 8 个输出",
+                           [&] { mm_reg1d<BM, BN, BK, TM><<<grd, blk>>>(dA, dB, dC, M, N, K); });
+        } else {
+            printf("  [skip] reg1d 需要 M,N%%64==0 且 K%%8==0\n");
+        }
+        if (ok2d) {
+            constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
+            dim3 blk((BM * BN) / (TM * TN));
+            dim3 grd(N / BN, M / BM);
+            run_and_record("E reg2d 128x128, 8x8", (double)BM * BN / (2.0 * (BM + BN)),
+                           "★ 算术强度跨过 ridge point",
+                           [&] { mm_reg2d<BM, BN, BK, TM, TN><<<grd, blk>>>(dA, dB, dC, M, N, K); });
+            run_and_record("F reg2d+vec, PAD=0", (double)BM * BN / (2.0 * (BM + BN)),
+                           "float4，转置写有 2-way bank 冲突",
+                           [&] { mm_reg2d_vec<BM, BN, BK, TM, TN, 0><<<grd, blk>>>(dA, dB, dC, M, N, K); });
+            run_and_record("F reg2d+vec, PAD=4", (double)BM * BN / (2.0 * (BM + BN)),
+                           "★ padding 消掉 bank 冲突",
+                           [&] { mm_reg2d_vec<BM, BN, BK, TM, TN, 4><<<grd, blk>>>(dA, dB, dC, M, N, K); });
+        } else {
+            printf("  [skip] reg2d 需要 M,N%%128==0 且 K%%8==0\n");
+        }
+    }
+
+    // =========================================================================
+    // 实验 4：工业基准 —— cuBLAS FP32 / cuBLAS TF32 / 裸 Tensor Core
+    // =========================================================================
+    printf("\n--- 实验 4：工业基准 + Tensor Core ----------------------------\n");
+    {
+        CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
+        run_and_record("G cuBLAS SGEMM (fp32)", -1.0, "工业基准",
+                       [&] { cublas_rowmajor_sgemm(handle, dA, dB, dC, M, N, K); });
+
+        // 注意：cublasSgemm 默认【不会】偷偷用 TF32，必须显式开。
+        // 这也是一个真实陷阱：拿手写 fp32 kernel 去比一个开了 TF32 的 torch.matmul，
+        // 等于拿自行车比汽车。对标前先确认双方精度模式一致。
+        CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
+        run_and_record("H cuBLAS SGEMM (TF32)", -1.0, "Tensor Core，尾数只有 10 位",
+                       [&] { cublas_rowmajor_sgemm(handle, dA, dB, dC, M, N, K); });
+        CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
+
+        if (M % 16 == 0 && N % 64 == 0 && K % 8 == 0) {
+            dim3 blk(32, 4);
+            dim3 grd(N / 64, M / 16);
+            run_and_record("I wmma TF32, 无 tiling", 0.25,
+                           "Tensor Core 但直读 global",
+                           [&] { mm_wmma_tf32_naive<<<grd, blk>>>(dA, dB, dC, M, N, K); });
+        } else {
+            printf("  [skip] wmma demo 需要 M%%16==0, N%%64==0, K%%8==0\n");
+        }
+    }
+
+    // =========================================================================
+    // 实验 5：形状研究 —— 为什么 decode 阶段 tiling 救不了你
+    // =========================================================================
+    // 这是今天最直接对接推理引擎的一段。M 就是 batch×seq：
+    //   prefill：M 很大（几千个 token 一起算）→ 方阵 GEMM → compute-bound
+    //   decode ：M = batch（1~几十）        → 瘦长 GEMM/GEMV → memory-bound
+    // 同一个算子、同一块卡，两个阶段落在 Roofline 的两侧，优化手段完全不同。
+    printf("\n--- 实验 5：形状研究（N=K=%d 固定，扫 M）----------------------\n", N);
+    printf("  %6s %10s %12s %10s %10s  %s\n", "M", "ms", "TFLOP/s", "GB/s", "AI", "判定");
+    {
+        for (int m : {1, 2, 8, 32, 128, 512, 2048}) {
+            if (m > M) break;
+            const double flop = 2.0 * m * N * K;
+            const double bytes = 4.0 * ((double)m * K + (double)K * N + (double)m * N);
+            const double ai = flop / bytes;
+            const double ms = time_ms(
+                [&] { cublas_rowmajor_sgemm(handle, dA, dB, dC, m, N, K); }, WARMUP, ITERS);
+            const double tflops = flop / (ms * 1e-3) / 1e12;
+            const double gbs = bytes / (ms * 1e-3) / 1e9;
+            const char* verdict = (ai < dev.fp32_peak / dev.bw_peak) ? "memory-bound"
+                                                                     : "compute-bound";
+            printf("  %6d %10.4f %12.2f %10.0f %10.2f  %s\n", m, ms, tflops, gbs, ai,
+                   verdict);
+        }
+    }
+    printf("  读法：M 小的时候 TFLOP/s 惨不忍睹，但 GB/s 接近 HBM 峰值 —— 说明卡没偷懒，\n");
+    printf("        是这个形状本身没有可复用的数据。这就是 decode 阶段的处境：\n");
+    printf("        唯一的解法是 ①提高 batch（continuous batching）②减少权重字节数（量化）。\n");
+
+    // ── 汇总表 ────────────────────────────────────────────────────────
+    printf("\n=============================================================\n");
+    printf(" 汇总：算术强度阶梯（ridge point = %.1f FLOP/Byte）\n",
+           dev.fp32_peak / dev.bw_peak);
+    printf("=============================================================\n");
+    printf(" %-28s %9s %10s %8s %9s %s\n", "kernel", "ms", "TFLOP/s", "%peak",
+           "模型AI", "备注");
+    double best = 0.0;
+    for (auto& r : rows) best = std::max(best, r.tflops);
+    for (auto& r : rows) {
+        char ai[16];
+        if (r.model_ai < 0) snprintf(ai, sizeof(ai), "%9s", "-");
+        else snprintf(ai, sizeof(ai), "%9.2f", r.model_ai);
+        printf(" %-28s %9.3f %10.2f %7.1f%% %s %s\n", r.name.c_str(), r.ms, r.tflops,
+               100.0 * (r.tflops * 1e12) / dev.fp32_peak, ai, r.note.c_str());
+    }
+    printf("\n 我的最快 FP32 kernel = %.2f TFLOP/s\n", best);
+    for (auto& r : rows) {
+        if (r.name.rfind("G cuBLAS", 0) == 0) {
+            printf(" cuBLAS SGEMM         = %.2f TFLOP/s  →  差距 %.2fx\n", r.tflops,
+                   r.tflops / std::max(1e-9, best));
+        }
+    }
+    printf("\n 差距不是 bug，是四条各自有名字的优化（笔记 §6）：\n");
+    printf("   ① warp 级 tile 划分 + 更深的寄存器分块\n");
+    printf("   ② double buffering / cp.async（H100 上是 TMA）—— 搬与算重叠\n");
+    printf("   ③ Tensor Core（TF32/FP16）—— 换一个更高的计算屋顶\n");
+    printf("   ④ shared memory swizzle + L2 感知的 block 调度顺序\n");
+
+    CUBLAS_CHECK(cublasDestroy(handle));
+    CUDA_CHECK(cudaFree(dA));
+    CUDA_CHECK(cudaFree(dB));
+    CUDA_CHECK(cudaFree(dC));
+    CUDA_CHECK(cudaFree(dRef));
+    return 0;
+}
 
 
 
