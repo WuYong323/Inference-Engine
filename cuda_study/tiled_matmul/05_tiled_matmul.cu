@@ -87,7 +87,7 @@
     do {                                                                                        \
         cudaError_t err=(expr);                                                                 \
         if(err!=cudaSuccess){                                                                   \
-            fprintf(stderr,"[CUDA] %s:%d   %s\n",__FILE__,__LINE,cudaGetErrorString(err));      \
+            fprintf(stderr,"[CUDA] %s:%d   %s\n",__FILE__,__LINE__,cudaGetErrorString(err));      \
             exit(EXIT_FAILURE);                                                                 \
         }                                                                                       \
     }while(0)
@@ -173,10 +173,10 @@ __global__ void mm_naive_coalesced(const float* __restrict__ A,const float* __re
 // 所有线程复用 TILE 次，然后才换下一块。
 //
 // 算术强度：
-//   每个 C 的 TILE×TILE 块，需要从 global 读 (K/TILE) 对 tile，每对 2*TILE²个 float
+//   每个 C 的 TILE×TILE 块，需要从 global 读 (K/TILE) 对 tile，每对 2*TILE?个 float
 //     → 访存量 = 2 * K * TILE * 4 Byte
-//     → 计算量 = 2 * TILE² * K FLOP
-//     → AI = 2*TILE²*K / (8*K*TILE) = TILE/4  FLOP/Byte
+//     → 计算量 = 2 * TILE? * K FLOP
+//     → AI = 2*TILE?*K / (8*K*TILE) = TILE/4  FLOP/Byte
 //   TILE=32 → 8 FLOP/Byte。H100 FP32 的 ridge point 约 20 → 仍然 memory-bound
 //   这个"还不够"就是 (D)(E) 存在的理由。
 //
@@ -494,6 +494,7 @@ __global__ void mm_wmma_tf32_naive(const float* __restrict__ A,const float* __re
 
     wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::row_major> fa;
     wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::row_major> fb;
+    wmma::fragment<wmma::accumulator,16,16,8,float> fc;
     wmma::fill_fragment(fc, 0.0f);
 
     for (int k = 0; k < K; k += 8) {
@@ -533,11 +534,15 @@ static DeviceInfo query_device() {
     d.name = p.name;
     d.sms = p.multiProcessorCount;
     d.smem_per_sm = p.sharedMemPerMultiprocessor;
+
+    int clockKHz = 0, memKHz = 0;
+    cudaDeviceGetAttribute(&clockKHz, cudaDevAttrClockRate,         0);
+    cudaDeviceGetAttribute(&memKHz,  cudaDevAttrMemoryClockRate,    0);
     // 假设：每个 SM 128 个 FP32 core，每 core 每周期 1 次 FMA = 2 FLOP
     // （Ampere/Hopper/Ada 的消费级与数据中心卡都成立；老架构需要改这个常数）
-    d.fp32_peak = 2.0 * 128.0 * d.sms * (p.clockRate * 1e3);
+    d.fp32_peak = 2.0 * 128.0 * d.sms * (clockKHz * 1e3);
     // HBM/GDDR 都是 DDR，所以乘 2
-    d.bw_peak = 2.0 * (p.memoryClockRate * 1e3) * (p.memoryBusWidth / 8.0);
+    d.bw_peak   = 2.0 * (memKHz * 1e3) * (p.memoryBusWidth / 8.0);
     if (d.bw_peak <= 0) d.bw_peak = 3.35e12;   // 驱动读不到时退回 H100 SXM 的标称值
     return d;
 }
@@ -551,7 +556,7 @@ struct Row {
     std::string note;
 };
 
-// 用 double 在 CPU 上抽样重算若干个 C 元素 —— 全量重算 4096³ 太慢（1.4e11 次
+// 用 double 在 CPU 上抽样重算若干个 C 元素 —— 全量重算 4096? 太慢（1.4e11 次
 // 乘加），抽样是工业上标准做法：既能抓住"整体算错"，也能抓住"某个 tile 边界错"。
 // 关键是抽样要覆盖边角（第一行/最后一行/最后一列）而不是纯随机。
 static double sampled_max_rel_err(const std::vector<float>& hA,
